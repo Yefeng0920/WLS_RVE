@@ -1,0 +1,3241 @@
+---
+title: "Robust point and variance estimation for meta-analyses with selective reporting and dependent effect sizes"
+author: "Yefeng Yang, Malgorzata Lagisz, Coralie Williams, Daniel W. A. Noble, Jinming Pan, & Shinichi Nakagawa"
+output:
+  word_document:
+    toc: yes
+    toc_depth: '2'
+  html_document:
+    toc: yes
+    toc_depth: '2'
+    df_print: paged
+  pdf_document:
+    toc: yes
+    toc_depth: 2
+    number_sections: yes
+    keep_tex: no
+---
+
+# Setup
+
+```{r setup, echo = FALSE}
+# Tidy
+ # rm(list=ls())
+ # graphics.off()
+# Preparing workspace
+knitr::opts_chunk$set(echo = TRUE, include = TRUE)
+# Loading packages
+pacman::p_load(knitr, # knit markdown
+               readxl, 
+               readr, 
+               metafor, 
+               dplyr, 
+               tidyverse,
+               clubSandwich,
+               janitor, 
+               patchwork, # layout of plots
+               cowplot, 
+               ggpubr,
+               gridExtra,
+               gridGraphics, # Redraw Base Graphics Using 'grid' Graphics. `gridGraphics` is required to handle base-R plots.
+               dabestr,
+               here,
+               nlme,
+               lme4,
+               car, # logit transformation, car::logit()
+               #boot, # Bootstrap Resampling
+               lmerTest,
+               vcd,
+               tidyr,
+               raincloudplots,
+               ggthemes,
+               RColorBrewer,
+               wesanderson,
+               ggsci, # palette: https://www.datanovia.com/en/blog/top-r-color-palettes-to-know-for-great-data-visualization/
+               ggplotify,
+               aplot
+               )
+
+
+
+h.calc <- function(mod){
+  # I2
+  # sigma2_v = typical sampling error variance
+  sigma2_v <- sum(1 / mod$vi) * (mod$k - 1) /
+    (sum(1 / mod$vi)^2 - sum((1 / mod$vi)^2))
+  # s^2_t = total variance
+  I2_total <- 100 * (sum(mod$sigma2) / (sum(mod$sigma2) + sigma2_v))
+  I2_each <- 100 * (mod$sigma2 / (sum(mod$sigma2) + sigma2_v))
+  #names(I2_each) <- paste0("I2_", model$s.names)
+  #names(I2_total) <- "I2_Total"
+  I2s_Shinichi <- c(I2_total, I2_each)
+  
+# matrix version  
+  W <- solve(mod$V)
+  X <- model.matrix(mod)
+  P <- W - W %*% X %*% solve(t(X) %*% W %*% X) %*% t(X) %*% W
+  I2_total2 <- 100* (sum(mod$sigma2) / (sum(mod$sigma2) + (mod$k - mod$p) / sum(diag(P))))
+  I2_each2 <- 100* (mod$sigma2 / (sum(mod$sigma2) + (mod$k - mod$p) / sum(diag(P))))
+  #names(I2_each2) <- paste0("I2_", model$s.names)
+  #names(I2_total2) <- "I2_Total2"
+  I2s_Wolfgang <- c(I2_total2, I2_each2)
+  
+  
+  # CVB
+  CVB_total <- (sqrt(sum(mod$sigma2)) / abs(mod$beta[1]))
+  CVB_each <- (sqrt(mod$sigma2) / abs(mod$beta[1]))
+  #names(CVB_each) <- paste0("CVB_", mod$s.names)
+  #names(CVB_total) <- "CVB_total"
+  CVBs <- c(CVB_total, CVB_each)
+  # M1
+  M1_total <- (sqrt(sum(mod$sigma2)) / (sqrt(sum(mod$sigma2)) + abs(mod$beta[1])))
+  M1_each <- (sqrt(mod$sigma2) / (sqrt(mod$sigma2) + abs(mod$beta[1])))
+  #names(M1_each) <- paste0("CVB_", mod$s.names)
+  #names(M1_total) <- "M1_total"
+  M1s <- c(M1_total, M1_each)
+  
+  hs <- data.frame(I2s_Shinichi,CVBs,M1s)
+  rownames(hs) <- c("Total", mod$s.names)
+  return(hs)
+
+}
+
+
+```
+
+# Load custom functions
+
+```{r custom functions}
+source(here("custom_func","custom_func.R"))
+
+# meta-analysis of magnitude
+## folded mean
+folded_es <-function(mean, variance){ # the sampling variance of magnitude   
+  mu <- mean
+  sigma <- sqrt(variance)
+  fold_mu <- sigma*sqrt(2/pi)*exp((-mu^2)/(2*sigma^2)) + mu*(1 - 2*pnorm(-mu/sigma))
+  fold_mu
+}
+## folded variance
+folded_var <- function(mean, variance){ # the sampling variance of magnitude   
+  mu <- mean
+  sigma <- sqrt(variance)
+  fold_mu <- sigma*sqrt(2/pi)*exp((-mu^2)/(2*sigma^2)) + mu*(1 - 2*pnorm(-mu/sigma))
+  fold_se <- sqrt(mu^2 + sigma^2 - fold_mu^2)
+  # adding se to make bigger mean
+  fold_v <- fold_se^2
+  fold_v
+}
+
+```
+
+
+# Import data and preprocess
+
+Import Jeremy data (the .csv file named 'all effect size data edited 24-08')
+
+```{r}
+dat_all <- read.csv(here("data","all effect size data edited 24-08.csv")) # http://jenrichmond.rbind.io/post/how-to-use-the-here-package/
+# check data
+head(dat_all)
+
+# remove NAs
+dat_all <- dat_all[!is.na(dat_all$eff.size) & !is.na(dat_all$var.eff.size), ]
+# remove negative and zero variance (sampling variance should be positive when fitting models)
+dat_all <- dat_all[dat_all$var.eff.size != 0, ]
+
+
+# check how many effect size measures in this dataset
+count(dat_all, eff.size.measure) # 11 measures
+
+# define effect size categories
+# this dataset has 11 types of effect size measures, based on which we grouped into 4 broad categories: 
+# (1) standadised mean differences (SMD), including cohens.d,  hedges.d, hedges.g, abs.hedges.d, SMD;
+# (2) log respond ratio (lnRR);
+# (3) correlation (Zr/r);
+# (4) binary, including log odds ratio, relative incident rate ratio (IRR)
+# (5) uncommon effect sizes, including mean difference, regression slope
+grouped_es <- NA
+# (1) SMD: cohens.d,  hedges.d, hedges.g, abs.hedges.d, SMD
+grouped_es[dat_all$eff.size.measure == "cohens.d"|
+           dat_all$eff.size.measure == "hedges.d"|
+           dat_all$eff.size.measure == "hedges.g"|
+           dat_all$eff.size.measure == "abs.hedges.d"|
+           dat_all$eff.size.measure == "SMD"] <- c("SMD") 
+# (2) lnRR: log.ratio
+grouped_es[dat_all$eff.size.measure == "log.ratio"] <- c("lnRR") 
+# (3) Zr: z.r
+grouped_es[dat_all$eff.size.measure == "z.r"] <- c("Zr") 
+# (4) binary: IRR, log.odds.ratio
+#grouped_es[dat_all$eff.size.measure == "IRR" | 
+#           dat_all$eff.size.measure == "log.odds.ratio"] <- c("binary") 
+# (5) uncommon: mean.diff, reg.slope
+grouped_es[dat_all$eff.size.measure == "mean.diff" |
+           dat_all$eff.size.measure == "reg.slope" | 
+           dat_all$eff.size.measure == "IRR" | 
+           dat_all$eff.size.measure == "log.odds.ratio"] <- c("uncommon") 
+
+# add grouped_es
+dat_all$grouped_es <- as.factor(grouped_es)
+
+```
+
+
+# Model fitting
+
+## MLRE - rma.mv()
+
+Original name is MLMA
+
+```{r}
+# add observational level id
+dat_all$obs <- 1:nrow(dat_all)
+
+# split the dataset into separate dataset according to the identity of meta-analysis
+ma.id <- dat_all$meta.analysis.id %>% unique()
+dat_list <- NA
+for (i in 1:length(ma.id)) {
+  dat_list[i] <- dat_all[dat_all$meta.analysis.id == i, ] %>% list() # compile them into a list, so that we can use sapply() to fit meta-analytic model for each meta-analytic case
+}
+
+# index the elements of the data list according to the order of meta-analysis cases. By doing this, we can find any meta-analytic case by retrieving its index
+names(dat_list) <- paste("MA", ma.id, sep = "_")
+
+# some datasets can not achieve convergence although we used different numerical optimizer, adjusted different step length. So we delete this dataset before model fitting
+dat_list <- dat_list[names(dat_list) != "MA_35" &
+                     names(dat_list) != "MA_67" &
+                     names(dat_list) != "MA_185" &
+                     names(dat_list) != "MA_313" &
+                     names(dat_list) != "MA_324" &
+                     names(dat_list) != "MA_358" &
+                     names(dat_list) != "MA_359" &
+                     names(dat_list) != "MA_406" &
+                     names(dat_list) != "MA_433"]
+
+#saveRDS(dat_list, file = "dat_list.Rds")
+dat_list <- readRDS(file = "dat_list.Rds")
+
+
+# fit intercept-only model for each meta-analytic case
+model_all <- NA
+for (i in 1:length(dat_list)) {
+  model_all[i] <- rma.mv(yi = eff.size, V = var.eff.size, random = list(~1|study, ~1|obs), method = "REML", test = "t", dfs="contain", data = dat_list[[i]], sparse = TRUE, control=list(optimizer="nlminb", rel.tol=1e-8, iter.max=1000)) %>% list()
+} # slightly less strict threshold (which by default is 1e-10); adjust the number of iterations (which by default is 150)
+
+# save to save time
+#saveRDS(model_all, file = "mod_fitted.Rds")
+model_all <- readRDS(file = "mod_fitted.Rds")
+
+```
+
+## LMEM - lme()
+
+```{r}
+# remove datasets with convergence issues for lme
+dat_list_lme <- dat_list[names(dat_list) != "MA_89" &
+                           names(dat_list) != "MA_92" & 
+                           names(dat_list) != "MA_91" &
+                           names(dat_list) != "MA_177" &
+                           names(dat_list) != "MA_181" & 
+                           names(dat_list) != "MA_194" &
+                           names(dat_list) != "MA_202" &
+                           names(dat_list) != "MA_416" & 
+                           names(dat_list) != "MA_432"]
+
+
+
+
+model_all_LMEM <- NA
+for (i in 1:length(dat_list_lme)) {
+  model_all_LMEM[i] <- lme(eff.size ~ 1, random = list(~ 1 | study, ~ 1| obs), weights = varFixed(~ var.eff.size), data=dat_list_lme[[i]], method = "REML", control =list(msMaxIter = 1000, msMaxEval = 1000)) %>% list()
+} # convergence issue https://stackoverflow.com/questions/68122117/nlminb-problem-convergence-error-code-1-message-iteration-limit-reached-wit
+
+
+# save to save time
+#saveRDS(model_all_LMEM, file = "model_all_LMEM_fitted.Rds")
+model_all_LMEM <- readRDS(file = "model_all_LMEM_fitted.Rds")
+
+```
+
+
+
+## MLFE - rma.mv()
+Original name if MFEM
+```{r}
+#multivariate fixed effect model with CRVE
+model_all_MFEM <- NA
+V <- NA
+for (i in 1:length(dat_list)) {
+### assuming that the effect sizes within studies are correlated with rho=0.5
+  V[i] <- impute_covariance_matrix(vi = dat_list[[i]]$var.eff.size, cluster = dat_list[[i]]$study, r = 0.5) %>% list()
+  model_all_MFEM[i] <- rma.mv(yi = eff.size, V = V[[i]], method = "REML", test = "t", dfs="contain", data = dat_list[[i]], sparse = TRUE, control=list(optimizer="nlminb", rel.tol=1e-8, iter.max=1000)) %>% list()
+} 
+
+# save to save time
+#saveRDS(model_all_MFEM, file = "model_all_MFEM_fitted.Rds")
+model_all_MFEM <- readRDS(file = "model_all_MFEM_fitted.Rds")
+
+### cluster robust variance estimation
+model_all_MFEM_RVE <- NA
+for (i in 1:length(model_all_MFEM)) {
+  model_all_MFEM_RVE[i] <- robust(model_all_MFEM[[i]], cluster = study, clubSandwich = TRUE) %>% list()
+} 
+
+
+# save to save time
+#saveRDS(model_all_MFEM_RVE, file = "model_all_MFEM_RVE_fitted.Rds")
+model_all_MFEM_RVE <- readRDS(file = "model_all_MFEM_RVE_fitted.Rds")
+
+```
+
+## FE - rma
+
+```{r}
+# fixed effect model with CRVE
+# two equivalent ways to conduct FE
+#rma.mv(yi = eff.size, V = var.eff.size, method = "REML", test = "t", dfs="contain", data = dat_list[[5]], sparse = TRUE, control=list(optimizer="nlminb", rel.tol=1e-8, iter.max=1000))
+
+#rma(yi = eff.size, vi = var.eff.size, method = "FE", test = "t", data = dat_list[[5]])
+
+#summary(lm(eff.size ~ 1, weights = 1/var.eff.size, data=dat_list[[5]]))$sigma * se of FE is equal to se of lm
+
+model_all_FE <- NA
+for (i in 1:length(dat_list)) {
+  model_all_FE[i] <- rma.mv(yi = eff.size, V = var.eff.size, method = "REML", test = "t", dfs="contain", data = dat_list[[i]], sparse = TRUE, control=list(optimizer="nlminb", rel.tol=1e-8, iter.max=1000)) %>% list()
+} 
+
+
+# save to save time
+#saveRDS(model_all_FE, file = "model_all_FE_fitted.Rds")
+model_all_FE <- readRDS(file = "model_all_FE_fitted.Rds")
+
+### cluster robust variance estimation
+model_all_FE_RVE <- NA
+for (i in 1:length(model_all_FE)) {
+  model_all_FE_RVE[i] <- robust(model_all_FE[[i]], cluster = study, clubSandwich = TRUE) %>% list()
+} 
+
+
+# save to save time
+#saveRDS(model_all_FE_RVE, file = "model_all_FE_RVE_fitted.Rds")
+model_all_FE_RVE <- readRDS(file = "model_all_FE_RVE_fitted.Rds")
+
+```
+
+
+
+## IVhet - rma
+
+```{r}
+# inverse heterogeneity model with CRVE
+# remove datasets with convergence issues for lme
+dat_list_IVhet <- dat_list[names(dat_list) != "MA_24" &
+                           names(dat_list) != "MA_88" &
+                           names(dat_list) != "MA_101"]
+
+
+# check current set limit
+#memory.limit() #  8006
+# increase limit
+#memory.limit(size = 16012)
+
+model_all_IVhet <- NA
+for (i in 1:length(dat_list_IVhet)) {
+  model_all_IVhet[i] <- rma(yi = eff.size, vi = var.eff.size, weights = I(1/var.eff.size), method = "REML", test = "t", data = dat_list_IVhet[[i]], control=list(optimizer="nlminb", rel.tol=1e-8, iter.max=1000)) %>% list()
+} 
+
+# save to save time
+#saveRDS(model_all_IVhet, file = "model_all_IVhet_fitted.Rds")
+model_all_IVhet <- readRDS(file = "model_all_IVhet_fitted.Rds")
+
+
+### cluster robust variance estimation
+model_all_IVhet_RVE <- NA
+for (i in 1:length(model_all_IVhet)) {
+  model_all_IVhet_RVE[i] <- robust(model_all_IVhet[[i]], cluster = study) %>% list()
+} 
+
+
+# save to save time
+#saveRDS(model_all_IVhet_RVE, file = "model_all_IVhet_RVE_fitted.Rds")
+model_all_IVhet_RVE <- readRDS(file = "model_all_IVhet_RVE_fitted.Rds")
+
+```
+
+
+## Publication bias test
+
+```{r}
+# small-study effects test - PET
+model_all_pb <- NA
+for (i in 1:length(dat_list)) {
+  model_all_pb[i] <- rma.mv(yi = eff.size, V = var.eff.size, random = list(~1|study, ~1|obs), mods = ~ I(sqrt(var.eff.size)), method = "REML", test = "t", data = dat_list[[i]], sparse = TRUE, control=list(optimizer="nlminb", rel.tol=1e-8, iter.max=1000)) %>% list()
+} # slightly less strict threshold (which by default is 1e-10); adjust the number of iterations (which by default is 150)
+
+
+# save to save time
+#saveRDS(model_all_pb, file = "mod_fitted_pb.Rds")
+model_all_pb <- readRDS(file = "mod_fitted_pb.Rds")
+
+
+
+# small-study effects test - PEESE
+model_all_pb2 <- NA
+for (i in 1:length(dat_list)) {
+  model_all_pb2[i] <- rma.mv(yi = eff.size, V = var.eff.size, random = list(~1|study, ~1|obs), mods = ~ I(var.eff.size), method = "REML", test = "t", data = dat_list[[i]], sparse = TRUE, control=list(optimizer="nlminb", rel.tol=1e-8, iter.max=1000), verbose = T) %>% list()
+} # slightly less strict threshold (which by default is 1e-10); adjust the number of iterations (which by default is 150)
+
+
+# save to save time
+#saveRDS(model_all_pb2, file = "mod_fitted_pb2.Rds")
+model_all_pb2 <- readRDS(file = "mod_fitted_pb2.Rds")
+```
+
+
+## UWLS - lm
+
+```{r}
+# fit intercept-only model
+
+model_all_WLS <- NA
+for (i in 1:length(dat_list)) {
+  model_all_WLS[i] <- lm(eff.size ~ 1, weights = 1/var.eff.size, data=dat_list[[i]]) %>% list()
+} 
+
+# save to save time
+#saveRDS(model_all_WLS, file = "mod_fitted_WLS.Rds")
+model_all_WLS <- readRDS(file = "mod_fitted_WLS.Rds")
+
+
+
+
+########## Multiplicative Method (MM) ##########
+dat4 <- dat_list[[4]]
+V_es <- diag(dat4$var.eff.size)
+row.names(V_es) <- dat4$obs
+
+method_MM_dat4 <- rma.mv(eff.size ~ 1, V = 0, 
+                          random=list(~1|obs),
+                          data=dat4, R=list(obs=V_es),
+                          Rscale=F)
+
+
+
+# CRVE not working if we use rma.mv to fit a weighted regression 
+robust(method_MM_dat4, cluster = study, clubSandwich = TRUE)
+
+coef_test(method_MM_dat4, vcov="CR2", cluster=dat4$study, test="naive-t")
+
+
+
+# VCV
+V4 <- impute_covariance_matrix(vi = dat_list[[4]]$var.eff.size, cluster = dat_list[[4]]$study, r = 0.5) 
+row.names(V4) <- dat4$obs
+method_MM_dat4_2 <-rma.mv(eff.size ~ 1, V = 0, 
+                          random=list(~1|obs),
+                          data=dat4, R=list(obs=V4),
+                          Rscale=F)
+
+
+coef_test(method_MM_dat4_2, vcov="CR2", cluster=dat4$study, test="naive-t")
+```
+
+
+## UWLS + RVE
+
+```{r}
+# calculate cluster robust errors
+# CR2 and accounting for weights - assume the error variances are inversely proportional to dat_list[[i]]$var.eff.size
+model_all_WLS_RVE <- NA
+for (i in 1:length(model_all_WLS)) {
+  model_all_WLS_RVE[i] <- coef_test(model_all_WLS[[i]], vcov="CR2", cluster=dat_list[[i]]$study, test="naive-t", target = dat_list[[i]]$var.eff.size) %>% list()
+} # test= "Satterthwaite"#  "naive-t"
+
+# save to save time
+#saveRDS(model_all_WLS_RVE, file = "mod_fitted_WLS_RVE.Rds")
+model_all_WLS_RVE <- readRDS(file = "mod_fitted_WLS_RVE.Rds")
+
+
+
+# try GEE
+library(geepack)
+geeInd <- geeglm(eff.size ~ 1, id=study, weights=1/var.eff.size,
+                 data=dat_list[[2]], family=gaussian, corstr="exchangeable")
+summary(geeInd)
+
+glsInd <- nlme::gls(eff.size ~ 1, weights = varFixed(~ var.eff.size),
+                 data=dat_list[[2]], correlation = corCompSymm())
+summary(glsInd)
+
+coef_test(glsInd, vcov="CR1", cluster=dat_list[[2]]$study, test="t")
+
+
+coef_test(model_all_WLS[[2]], vcov="CR2", cluster=dat_list[[2]]$study, test="z")
+
+
+
+# CR2 without accounting for weights
+model_all_WLS_RVE2 <- NA
+for (i in 1:length(model_all_WLS)) {
+  model_all_WLS_RVE2[i] <- coef_test(model_all_WLS[[i]], vcov="CR2", cluster=dat_list[[i]]$study, test="naive-t") %>% list()
+} 
+
+# save to save time
+#saveRDS(model_all_WLS_RVE2, file = "mod_fitted_WLS_RVE2.Rds")
+model_all_WLS_RVE2 <- readRDS(file = "mod_fitted_WLS_RVE2.Rds")
+
+
+# CR1 with small study adjustment Satterthwaite - too conservative
+model_all_WLS_RVE2 <- NA
+for (i in 1:length(model_all_WLS)) {
+  model_all_WLS_RVE2[i] <- coef_test(model_all_WLS[[i]], vcov="CR2", cluster=dat_list[[i]]$study, test="Satterthwaite") %>% list()
+} 
+
+# CR2 with small study adjustment Satterthwaite
+model_all_WLS_RVE3 <- NA
+for (i in 1:length(model_all_WLS)) {
+  model_all_WLS_RVE3[i] <- coef_test(model_all_WLS[[i]], vcov="CR2", cluster=dat_list[[i]]$study, test="Satterthwaite") %>% list()
+} 
+
+
+# investigation - http://jepusto.github.io/clubSandwich/reference/coef_test.html
+coef_test(model_all_WLS[[1]], vcov="CR2", cluster=dat_list[[1]]$study, test="naive-t") # CR1
+
+coef_test(model_all_WLS[[1]], vcov="CR2", test="naive-t", cluster=dat_list[[1]]$study, target = dat_list[[1]]$var.eff.size)
+
+coef_test(model_all_WLS[[1]], vcov="CR2", cluster=dat_list[[1]]$study)
+
+# save to save time
+#saveRDS(model_all_WLS_RVE, file = "mod_fitted_WLS_RVE.Rds")
+model_all_WLS_RVE <- readRDS(file = "mod_fitted_WLS_RVE.Rds")
+
+```
+
+# Dataset characteristics
+
+```{r}
+# summarize dataset characteristics
+dat_list2 <- dat_list[names(dat_list) != "MA_35" & names(dat_list) != "MA_67" & names(dat_list) != "MA_185" & names(dat_list) != "MA_313" & names(dat_list) != "MA_324" & names(dat_list) != "MA_358" & names(dat_list) != "MA_359" & names(dat_list) != "MA_406" & names(dat_list) != "MA_433" & names(dat_list) != "MA_89" & names(dat_list) != "MA_92" & names(dat_list) != "MA_91" & names(dat_list) != "MA_177" & names(dat_list) != "MA_181" & names(dat_list) != "MA_194" & names(dat_list) != "MA_202" & names(dat_list) != "MA_416" &  names(dat_list) != "MA_432" & names(dat_list) != "MA_24" & names(dat_list) != "MA_88" & names(dat_list) != "MA_101"]
+
+# unlist
+dat_list2 <- plyr::ldply(dat_list2, data.frame)
+# how many es per study
+length(dat_list2$obs)/length(unique(dat_list2$study)) # 7.590292
+# how many cases with publication bias
+mod_stats2 <- readRDS(file = "mod_stats2.Rds")
+## alpha = 0.05
+tabyl(mod_stats2, sig_se) # count(mod_stats2, sig_se)
+## alpha = 0.1
+tabyl(mod_stats2, sig_se2)
+
+```
+
+
+# Extract estimates
+
+```{r}
+# due to different models have different convergence issues, we use index to unify them
+`%notin%` <- Negate(`%in%`) # https://stackoverflow.com/questions/14105229/what-is-the-opposite-of-in-in-r
+index <- names(dat_list) %notin% c("MA_89", "MA_92", "MA_91", "MA_177", "MA_181", "MA_194", "MA_202", "MA_416", "MA_432") # cases with convergence issues from LMEM
+  
+# CR2 with weights for WLS
+## first excluding IVhet
+mod_stats_LMEM <- data.frame(MA_case = names(dat_list)[index],
+                        beta0_MLMA = sapply(model_all[index], function(x) coef(summary(x))[1]) %>% as.numeric(),
+                        beta0_WLS = sapply(model_all_WLS[index], function(x) coef(summary(x))[1]), 
+                        beta0_WLS_RVE = sapply(model_all_WLS_RVE[index], function(x) x$beta),
+                        beta0_FE = sapply(model_all_FE[index], function(x) coef(summary(x))[1]) %>% as.numeric(),
+                        beta0_FE_RVE = sapply(model_all_FE_RVE[index], function(x) coef(summary(x))[1]) %>% as.numeric(),
+                        beta0_MFEM = sapply(model_all_MFEM[index
+                                                           ], function(x) coef(summary(x))[1]) %>% as.numeric(),
+                        beta0_MFEM_RVE = sapply(model_all_MFEM_RVE[index], function(x) coef(summary(x))[1]) %>% as.numeric(),
+                        beta0_LMEM = sapply(model_all_LMEM, function(x) coef(summary(x))[1]), #LMEM does not need index because it was already done from dataset when fitting model
+                        se_MLMA = sapply(model_all[index], function(x) coef(summary(x))[2]) %>% as.numeric(),
+                        se_WLS = sapply(model_all_WLS[index], function(x) coef(summary(x))[2]),
+                        se_WLS_RVE = sapply(model_all_WLS_RVE[index], function(x) x$SE),
+                        se_FE = sapply(model_all_FE[index], function(x) coef(summary(x))[2]) %>% as.numeric(),
+                        se_FE_RVE = sapply(model_all_FE_RVE[index], function(x) coef(summary(x))[2]) %>% as.numeric(),
+                        se_MFEM = sapply(model_all_MFEM[index], function(x) coef(summary(x))[2]) %>% as.numeric(),
+                        se_MFEM_RVE = sapply(model_all_MFEM_RVE[index], function(x) coef(summary(x))[2]) %>% as.numeric(),
+                        se_LMEM = sapply(model_all_LMEM, function(x) coef(summary(x))[2]),
+                        beta_pb = sapply(model_all_pb[index], function(x) x$beta[2]), # publication bias info
+                        
+                        p_MLMA = sapply(model_all[index], function(x) coef(summary(x))[5]) %>% as.numeric(), 
+                        p_pb = sapply(model_all_pb[index], function(x) x$pval[2]),
+                        c_hat = sapply(model_all_WLS[index], function(x) sigma(x)^2),
+                        beta0_PET = sapply(model_all_pb[index], function(x) x$beta[1]),
+                        se_PET = sapply(model_all_pb[index], function(x) x$se[1]),
+                        p_PET = sapply(model_all_pb[index], function(x) x$pval[1]),
+                        beta0_PEESE = sapply(model_all_pb2[index], function(x) x$beta[1]),
+                        se_PEESE = sapply(model_all_pb2[index], function(x) x$se[1]),
+                        p_PEESE = sapply(model_all_pb2[index], function(x) x$pval[1])) 
+
+# combine IVhet
+index2 <- names(dat_list) %notin% c("MA_24", "MA_88" , "MA_101") # cases with convergence issues from IVhet
+mod_stats_IVhet <- data.frame(MA_case = names(dat_list)[index2], # replace index by "index2"
+                        beta0_IVhet = sapply(model_all_IVhet, function(x) ifelse(class(x)[1] == "rma.uni",coef(summary(x))[1],NA)) %>% as.numeric(), 
+                        beta0_IVhet_RVE = sapply(model_all_IVhet_RVE, function(x) ifelse(class(x)[1] == "robust.rma",coef(summary(x))[1],NA)) %>% as.numeric(),
+                        se_IVhet = sapply(model_all_IVhet, function(x) ifelse(class(x)[1] == "rma.uni",coef(summary(x))[2],NA)) %>% as.numeric(),
+                        se_IVhet_RVE = sapply(model_all_IVhet_RVE, function(x) ifelse(class(x)[1] == "robust.rma",coef(summary(x))[2],NA)) %>% as.numeric())
+
+## combine the two parts
+mod_stats <- left_join(mod_stats_LMEM,mod_stats_IVhet,by="MA_case")
+
+# how many significant results?
+length(which(mod_stats$p_MLMA<0.05))
+
+
+# get sample size for each MA
+obs_N <- NA
+for (i in 1:length(dat_list)) {
+  obs_N[i] <- nrow(dat_list[[i]]) %>% list()
+}
+
+study_N <- NA
+for (i in 1:length(dat_list)) {
+  study_N[i] <- unique(dat_list[[i]]$study) %>% length() %>% list()
+}
+
+#mod_stats$obs_N <- unlist(obs_N)
+info_add <- data.frame(`No.` = sapply(dat_list, function(x) x$paper.id[1]),
+                       MA_case = names(dat_list),
+                       obs_N = sapply(obs_N, function(x) x %>% as.numeric),
+                       study_N = sapply(study_N, function(x) x %>% as.numeric),
+                       es.type = sapply(dat_list, function(x) x$grouped_es[1]), # get effect size type for each MA
+                       icc = sapply(model_all, function(x) x$sigma2[1]/sum(x$sigma2)))# get ICC for each MA
+mod_stats <- left_join(mod_stats,info_add,by="MA_case")
+
+
+# summarize estimated dispersion constant
+mod_stats %>% dplyr::group_by(es.type) %>%
+  summarise_at(vars(c_hat), list(mean = mean,
+                                 sd = sd,
+                                 median = median))
+
+
+
+# extract heterogeneity
+#h_stats <- data.frame(MA_case = names(dat_list),
+#                      I2s_Shinichi = sapply(model_all, function(x) #h.calc(x)[1,1]), 
+#                      CVBs = sapply(model_all, function(x) h.calc(x)[1,2]),
+#                      M1s = sapply(model_all, function(x) h.calc(x)[1,3]))
+
+h_stats <- readRDS(file = "h_stats.Rds")
+
+
+# merge
+mod_stats2 <- left_join(mod_stats, h_stats, by = "MA_case", keep = F)
+
+# opposite sign of beta0
+mod_stats2 <- mod_stats2 %>% mutate(sign = base::ifelse(beta0_MLMA*beta0_WLS > 0, "Same", "Opposite"))
+# whether sig beta0
+mod_stats2 <- mod_stats2 %>% mutate(sig_beta0 = base::ifelse(p_MLMA < 0.05, "True effect", "Null effect"))
+
+# flipping sign of beta0 if it was negative
+mod_stats2 <- mod_stats2 %>% mutate(beta0_MLMA_flip = base::ifelse(beta0_MLMA < 0 & beta0_WLS < 0, beta0_MLMA*(-1), beta0_MLMA))
+
+mod_stats2 <- mod_stats2 %>% mutate(beta0_WLS_flip = base::ifelse(beta0_MLMA < 0 & beta0_WLS < 0, beta0_WLS*(-1), beta0_WLS))
+
+mod_stats2$beta0_WLS_RVE_flip <- mod_stats2$beta0_WLS_flip
+
+mod_stats2 <- mod_stats2 %>% mutate(beta0_MFEM_flip = base::ifelse(beta0_MLMA < 0 & beta0_MFEM < 0, beta0_MFEM*(-1), beta0_MFEM))
+
+mod_stats2 <- mod_stats2 %>% mutate(beta0_LMEM_flip = base::ifelse(beta0_MLMA < 0 & beta0_LMEM < 0, beta0_LMEM*(-1), beta0_LMEM))
+
+mod_stats2 <- mod_stats2 %>% mutate(beta0_PET_flip = base::ifelse(beta0_MLMA < 0 & beta0_PET < 0, beta0_PET*(-1), beta0_PET))
+
+mod_stats2 <- mod_stats2 %>% mutate(beta0_PEESE_flip = base::ifelse(beta0_MLMA < 0 & beta0_PEESE < 0, beta0_PEESE*(-1), beta0_PEESE))
+
+# whether publication bias exists
+## alpha = 0.05
+mod_stats2 <- mod_stats2 %>% mutate(sig_se = base::ifelse(p_pb < 0.05 & beta0_MLMA*beta_pb > 0, "Publication bias", "No publicaiton bias"))
+
+mod_stats2 <- mod_stats2 %>% mutate(sig_pb = base::ifelse(p_pb < 0.05 & beta0_MLMA*beta_pb > 0, "Yes", "No"))
+
+## alpha = 0.1
+mod_stats2 <- mod_stats2 %>% mutate(sig_se2 = base::ifelse(p_pb < 0.1 & beta0_MLMA*beta_pb > 0, "Publication bias", "No publicaiton bias"))
+
+mod_stats2 <- mod_stats2 %>% mutate(sig_pb2 = base::ifelse(p_pb < 0.1 & beta0_MLMA*beta_pb > 0, "Yes", "No"))
+
+
+#saveRDS(mod_stats2, file = "mod_stats2.Rds")
+mod_stats2 <- readRDS(file = "mod_stats2.Rds")
+
+# https://osf.io/842hr # Robust Bayesian Meta-Analysis: Model-Averaging Across Complementary Publication Bias
+mod_stats2 <- mod_stats2 %>% mutate("beta0_PETPEESE_flip" = ifelse(p_PET < 0.1, beta0_PEESE_flip, beta0_PET_flip),
+                                    "beta0_PETPEESE" = ifelse(p_PET < 0.1, beta0_PEESE, beta0_PET),
+                                    "se_PETPEESE" = ifelse(p_PET < 0.1, se_PEESE, se_PET))
+```
+
+
+# beta and SE
+
+Comparison of the population mean effect size estimates and their standard errors obtained from different meta-analytic models. 
+
+The published meta-analyses were identified as having publication bias at the significance level of 0.05. A sensitivity analysis was conducted using 0.1 as the significance level.
+
+```{r}
+# convert beta0
+mod_stats2_beta0 <- mod_stats2 %>%
+  select(MA_case, beta0_MLMA_flip, beta0_WLS_flip, beta0_MFEM_flip, sig_se) %>%
+  pivot_longer(cols = c(beta0_WLS_flip, beta0_MFEM_flip),
+               names_to = "estimator_alternative", values_to = "beta0_alternative") 
+# %>% mutate(estimator_alternative = gsub("[0-9]+", "", estimator_alternative))
+
+names(mod_stats2_beta0)[names(mod_stats2_beta0) == "beta0_MLMA_flip"] <- c("beta0")
+
+mod_stats2_beta0$estimator_alternative <- as.factor(mod_stats2_beta0$estimator_alternative)
+
+mod_stats2_beta0$estimator_alternative <- factor(mod_stats2_beta0$estimator_alternative, levels = c("beta0_WLS_flip", "beta0_MFEM_flip"))
+
+
+# with marginal distribution
+## recode
+mod_stats2_beta0 <- mod_stats2_beta0 %>% mutate(estimator_alternative=dplyr::recode(estimator_alternative, 'beta0_WLS_flip'='UWLS', 'beta0_MFEM_flip'='FE + VCV'))
+
+
+# with publication bias 
+beta0_all_pb1 <-  mod_stats2_beta0 %>% filter(sig_se == "Publication bias") %>% 
+  ggplot(aes(x = beta0, y = beta0_alternative)) +
+  #geom_point(aes(size = M1s), alpha = 0.5, color = "#0072B2", fill = "#0072B2") 
+  geom_point(aes(color = estimator_alternative, fill = estimator_alternative), alpha = 0.3) +
+  #facet_grid(. ~ sig_se) +
+  #facet_grid(. ~ sig_beta0) +
+  #viridis::scale_color_viridis(discrete = T) + 
+  scale_color_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(3,1)])+ #  BottleRocket2
+  #scale_fill_manual(values = wes_palette("GrandBudapest2", 4, type = "discrete")) +
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "red") +
+  #stat_regline_equation(label.y = 3.5, aes(label = ..eq.label..)) +
+  #scale_color_hue(labels = c("UWLS", "MFEM", "LMEM")) + # editing legend (text) labels - https://stackoverflow.com/questions/23635662/editing-legend-text-labels-in-ggplot
+  geom_abline(intercept = 0, slope = 1, colour= 'black', linetype = "dashed") + 
+  labs(x = expression(paste(hat(beta),""[(MLMA)] ~ "(Benchmark)")), y = expression(paste(hat(beta),""[] ~ "(Alternative)")), size = expression(italic(I)^2)) +
+  guides(color = guide_legend(title = "First-step model"), fill = "none") +
+  scale_x_continuous(limits = c(-1,3)) +
+  scale_y_continuous(limits = c(-1,3)) +
+  theme_bw() +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = 0.5, y = 2.5, label = "Publication bias", color = "red", fontface = "bold") 
+
+# marginal # https://github.com/daattali/ggExtra
+beta0_all_pb1.2 <- ggExtra::ggMarginal(beta0_all_pb1, groupColour = TRUE, groupFill = TRUE)
+
+
+# without publication bias
+beta0_all_pb0 <- mod_stats2_beta0 %>% filter(sig_se == "No publicaiton bias") %>% 
+  ggplot(aes(x = beta0, y = beta0_alternative)) +
+  #geom_point(aes(size = M1s), alpha = 0.5, color = "#0072B2", fill = "#0072B2") 
+  geom_point(aes(color = estimator_alternative, fill = estimator_alternative), alpha = 0.3) +
+  #facet_grid(. ~ sig_se) +
+  #facet_grid(. ~ sig_beta0) +
+  theme_bw() +
+  #viridis::scale_color_viridis(discrete = T) + 
+  scale_color_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(3,1)]) +
+  #scale_fill_manual(values = wes_palette("GrandBudapest2", 4, type = "discrete"))+ 
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "red") +
+  #stat_regline_equation(label.y = 3.5, aes(label = ..eq.label..)) +
+  #scale_color_hue(labels = c("UWLS", "MFEM", "LMEM")) + # editing legend (text) labels - https://stackoverflow.com/questions/23635662/editing-legend-text-labels-in-ggplot
+  geom_abline(intercept = 0, slope = 1, colour= 'black', linetype = "dashed") + 
+  labs(x = expression(paste(hat(beta),""[(MLMA)] ~ "(Benchmark)")), y = expression(paste(hat(beta),""[] ~ "(Alternative)")), size = expression(italic(I)^2), parse = TRUE) +
+  guides(color = guide_legend(title = "First-step model"), fill = "none") +
+  scale_x_continuous(limits = c(-1,3)) +
+  scale_y_continuous(limits = c(-1,3)) +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = 0.5, y = 2.5, label = "No publication bias", color = "red", fontface = "bold") 
+
+beta0_all_pb0.2 <- ggExtra::ggMarginal(beta0_all_pb0, groupColour = TRUE, groupFill = TRUE)
+
+
+
+#------------------------------------------------------------------#
+# convert se_beta0
+mod_stats2_se <- mod_stats2 %>%
+  select(MA_case, se_MLMA, se_WLS, se_WLS_RVE, se_MFEM, se_MFEM_RVE, sig_se, sig_beta0) %>%
+  pivot_longer(cols = c(se_WLS, se_WLS_RVE, se_MFEM, se_MFEM_RVE),
+               names_to = "estimator_alternative", values_to = "se_alternative") 
+names(mod_stats2_se)[names(mod_stats2_se) == "se_MLMA"] <- c("se")
+
+mod_stats2_se$estimator_alternative <- as.factor(mod_stats2_se$estimator_alternative)
+
+mod_stats2_se$estimator_alternative <- factor(mod_stats2_se$estimator_alternative, levels = c("se_WLS", "se_WLS_RVE", "se_MFEM", "se_MFEM_RVE"))
+
+# recode
+mod_stats2_se <- mod_stats2_se %>% mutate(estimator_alternative=dplyr::recode(estimator_alternative, 'se_WLS'='UWLS', 'se_WLS_RVE'='UWLS + RVE', 'se_MFEM'='FE + VCV' , "se_MFEM_RVE" = "FE + VEV"))
+
+# add whether using RVE
+mod_stats2_se$RVE <- rep(c("Before CRVE","After CRVE"), 448*2) # nrow(mod_stats2) = 448 or nrow(mod_stats2_se)/4
+
+  
+# se_beta0 (log scale)
+# before CRVE
+se_all_pb1 <- mod_stats2_se %>% filter(RVE == "Before CRVE") %>% 
+  ggplot(aes(x = log(se), y = log(se_alternative))) +
+  #geom_point(aes(size = M1s), alpha = 0.5, color = "#0072B2", fill = "#0072B2") 
+  geom_point(aes(color = estimator_alternative), alpha = 0.8) +
+  #facet_grid(. ~ sig_beta0) +
+  #facet_grid(. ~ sig_beta0) +
+  #viridis::scale_color_viridis(discrete = T) + 
+  scale_color_manual(values = wes_palette("Moonrise3", 4, type = "discrete"))+ 
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "red") +
+  #stat_regline_equation(label.y = 3.5, aes(label = ..eq.label..)) +
+  #scale_color_hue(labels = c("UWLS", "MFEM", "LMEM")) + # editing legend (text) labels - https://stackoverflow.com/questions/23635662/editing-legend-text-labels-in-ggplot
+  geom_abline(intercept = 0, slope = 1, colour= 'black', linetype = "dashed") + 
+  labs(x = expression(paste("SE","(",hat(beta),""[(MLMA)],")" ~ "(Benchmark) (log)")), y = expression(paste("SE","(",hat(beta),""[],")" ~ "(Alternative) (log)")), size = expression(italic(I)^2)) + 
+  guides(color = guide_legend(title = "First-step model"), fill = "none") +
+  scale_x_continuous(limits = c(-5,0)) +
+  scale_y_continuous(limits = c(-5,0)) +
+  theme_bw() +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = -3.0, y = -0.5, label = "Before second-step CRVE", color = "red", fontface = "bold")
+se_all_pb1.2 <- ggExtra::ggMarginal(se_all_pb1, groupColour = TRUE, groupFill = TRUE)
+
+
+# after CRVE
+se_all_pb0 <- mod_stats2_se %>% filter(RVE == "After CRVE") %>% 
+  ggplot(aes(x = log(se), y = log(se_alternative))) +
+  #geom_point(aes(size = M1s), alpha = 0.5, color = "#0072B2", fill = "#0072B2") 
+  geom_point(aes(color = estimator_alternative, fill = estimator_alternative), alpha = 0.8) +
+  #facet_grid(. ~ sig_beta0) +
+  #facet_grid(. ~ sig_beta0) +
+  #viridis::scale_color_viridis(discrete = T) + 
+  scale_color_manual(values = wes_palette("Moonrise3", 4, type = "discrete"))+ 
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "red") +
+  #stat_regline_equation(label.y = 3.5, aes(label = ..eq.label..)) +
+  #scale_color_hue(labels = c("UWLS", "MFEM", "LMEM")) + # editing legend (text) labels - https://stackoverflow.com/questions/23635662/editing-legend-text-labels-in-ggplot
+  geom_abline(intercept = 0, slope = 1, colour= 'black', linetype = "dashed") + 
+  labs(x = expression(paste("SE","(",hat(beta),""[(MLMA)],")" ~ "(Benchmark) (log)")), y = expression(paste("SE","(",hat(beta),""[],")" ~ "(Alternative) (log)")), size = expression(italic(I)^2)) + 
+  guides(color = guide_legend(title = "First-step model"), fill = "none") +
+  scale_x_continuous(limits = c(-5,0)) +
+  scale_y_continuous(limits = c(-5,0)) +
+  theme_bw() +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = -3.0, y = -0.5, label = "After second-step CRVE", color = "red", fontface = "bold")
+se_all_pb0.2 <- ggExtra::ggMarginal(se_all_pb0, groupColour = TRUE, groupFill = TRUE)
+
+
+# convert t
+mod_stats2_t <- mod_stats2 %>%
+  select(MA_case, t_MLMA_flip, t_WLS_flip, t_MFEM_flip, t_LMEM_flip, sig_se, sig_beta0) %>%
+  pivot_longer(cols = c(t_WLS_flip, t_MFEM_flip, t_LMEM_flip),
+               names_to = "estimator_alternative", values_to = "t_alternative") 
+# %>% mutate(estimator_alternative = gsub("[0-9]+", "", estimator_alternative))
+
+names(mod_stats2_t)[names(mod_stats2_t) == "t_MLMA_flip"] <- c("t")
+
+mod_stats2_t$estimator_alternative <- as.factor(mod_stats2_t$estimator_alternative)
+
+mod_stats2_t$estimator_alternative <- factor(mod_stats2_t$estimator_alternative, levels = c("t_WLS_flip", "t_MFEM_flip", "t_LMEM_flip"))
+
+
+png(filename = "t_all.png", width = 8, height = 5, units = "in", type = "windows", res = 400)
+  mod_stats2_t %>%
+  ggplot(aes(x = t, y = t_alternative)) +
+  #geom_point(aes(size = M1s), alpha = 0.5, color = "#0072B2", fill = "#0072B2") 
+  geom_point(aes(color = estimator_alternative), alpha = 0.8) +
+  facet_grid(. ~ sig_beta0) +
+  #facet_grid(. ~ sig_beta0) +
+  viridis::scale_color_viridis(discrete = T) + 
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "red") +
+  #stat_regline_equation(label.y = 3.5, aes(label = ..eq.label..)) +
+  scale_color_hue(labels = c("UWLS", "MFEM", "LMEM")) + # editing legend (text) labels - https://stackoverflow.com/questions/23635662/editing-legend-text-labels-in-ggplot
+  geom_abline(intercept = 0, slope = 1, colour= 'black', linetype = "dashed") + 
+  labs(x = expression(paste("t","(",beta[0],""[(MLRE)],")")), y = expression(paste("t","(",beta[0],""[(Alternative)],")")), size = expression(italic(I)^2)) +
+  scale_x_continuous(limits = c(-5,30)) +
+  scale_y_continuous(limits = c(-5,30)) +
+  guides(color = guide_legend(title = "Estimator")) + 
+  theme_bw() +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=10),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + theme(legend.position = "top")
+dev.off()
+
+```
+
+
+# D_beta vs publication bias
+
+The relationship between the difference in the population mean effect size estimates and the severity of publication bias.
+
+```{r}
+# degree of difference in beta
+png(filename = "./MLMA - WLS.png", width = 8, height = 5, units = "in", type = "windows", res = 400)
+par(mfrow = c(1, 1)) 
+hist(mod_stats2$beta0_MLMA_flip - mod_stats2$beta0_WLS_flip, main = "MLMA - WLS", xlab = "MLMA - WLS", breaks = 50)
+dev.off()
+
+
+# WLS
+mod_stats2 <- mod_stats2 %>% mutate(D = beta0_MLMA_flip - beta0_WLS_flip)
+mod_stats2$es.type <- as.factor(mod_stats2$es.type)
+mod_stats2$es.type <- factor(mod_stats2$es.type, levels = c("SMD", "lnRR", "Zr", "uncommon"))
+#mod_stats2$sig_pb <- as.factor(mod_stats2$sig_pb)
+#mod_stats2$sig_pb <- factor(mod_stats2$sig_pb, levels = c("Yes", "No"))
+
+# https://rpkgs.datanovia.com/ggpubr/reference/ggviolin.html
+png(filename = "./D (splitted by es)2.png", width = 8, height = 5, units = "in", type = "windows", res = 400)
+# https://rpkgs.datanovia.com/ggpubr/reference/ggviolin.html
+# split by true effect
+ggviolin(mod_stats2, "es.type", "D", color = "sig_se", 
+   palette = wes_palette("Royal2", 2, type = "discrete"),
+   add = "boxplot", add.params = list(fill = "white")) + 
+   guides(color = guide_legend(title = "")) + 
+   theme(legend.background = element_rect(color = "transparent"),
+         legend.key=element_rect(color="transparent")) + 
+   labs(x = "Effect size measures", y = expression(paste( beta[0],""[(MLRE)]~"-"~beta[0],""[(UWLS)])))
+dev.off()
+
+
+
+# slope of publication bias vs. D
+mod_stats2 <- mod_stats2 %>% mutate(D = beta0_MLMA_flip - beta0_WLS_flip)
+# flipping sign of slope of SE if beta0 was negative
+mod_stats2 <- mod_stats2 %>% mutate(beta_pb_flip = base::ifelse(beta0_MLMA < 0, beta_pb*(-1), beta_pb))
+
+mod_stats2$sig_se <- as.factor(mod_stats2$sig_se)
+mod_stats2$sig_se <- factor(mod_stats2$sig_se, levels = c("Publication bias", "No publicaiton bias"))
+
+# with publication bias
+D_vs._slope_SE1 <- mod_stats2 %>% filter(sig_se == "Publication bias") %>% 
+  ggplot(aes(x = beta_pb_flip, y = D)) +
+  #geom_point(aes(color = es.type), alpha = 0.8) + 
+  geom_point(color = wes_palette("Rushmore1", 4, type = "discrete")[c(3)], alpha = 0.3) + 
+  #facet_grid(. ~ sig_se) +
+  #scale_color_manual(values = wes_palette("BottleRocket2", 4, type = "discrete")) +
+  xlim(0,10) + ylim(-2.5,2.5) + 
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "black") +
+  labs(x = expression(paste("The severity of selective reporting")), y = expression(paste(" ", hat(beta),""[(MLMA)]~"-"~hat(beta),""[(UWLS)])), size = expression(italic(I)^2)) +
+  #guides(color = "none") +
+  #scale_x_continuous(limits = c(0,3)) +
+  #scale_y_continuous(limits = c(0,3)) +
+  theme_bw() +
+  guides(color = guide_legend(title = "Effect size measures"),
+         shape = guide_legend(title = "Mean effects")) +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=12),
+        legend.text = element_text(size=12),
+        strip.background = element_rect(fill = "transparent"),
+        strip.text = element_text(size = 12),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + # theme(legend.position = "top")
+  annotate("text", x = 5, y = 2, label = "Selective reporting", color = "red", fontface = "bold")
+D_vs._slope_SE1
+
+
+
+# without publication bias
+D_vs._slope_SE2 <- mod_stats2 %>% filter(sig_se == "No publicaiton bias") %>% 
+  ggplot(aes(x = beta_pb_flip, y = D)) +
+  #geom_point(aes(color = es.type), alpha = 0.8) + 
+  geom_point(color = wes_palette("Rushmore1", 4, type = "discrete")[c(3)], alpha = 0.3) + 
+  #facet_grid(. ~ sig_se) +
+  #scale_color_manual(values = wes_palette("BottleRocket2", 4, type = "discrete")) +
+  xlim(-5,5) + ylim(-2.5,2.5) + 
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "black") +
+  labs(x = expression(paste("The severity of selective reporting")), y = expression(paste(" ", hat(beta),""[(MLMA)]~"-"~hat(beta),""[(UWLS)])), size = expression(italic(I)^2)) +
+  #guides(color = "none") +
+  #scale_x_continuous(limits = c(0,3)) +
+  #scale_y_continuous(limits = c(0,3)) +
+  theme_bw() +
+  guides(color = guide_legend(title = "Effect size measures"),
+         shape = guide_legend(title = "Mean effects")) +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=12),
+        legend.text = element_text(size=12),
+        strip.background = element_rect(fill = "transparent"),
+        strip.text = element_text(size = 12),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + # theme(legend.position = "top")
+  annotate("text", x = 0, y = 2, label = "No selective reporting", color = "red", fontface = "bold")
+D_vs._slope_SE2
+
+
+# MFEM
+# with publication bias
+mod_stats2 <- mod_stats2 %>% mutate(D2 = beta0_MLMA_flip - beta0_MFEM_flip)
+
+D_vs._slope_SE3 <- mod_stats2 %>% filter(sig_se == "Publication bias") %>% 
+  ggplot(aes(x = beta_pb_flip, y = D2)) +
+  #geom_point(aes(color = es.type), alpha = 0.8) + 
+  geom_point(color = wes_palette("Rushmore1", 4, type = "discrete")[c(3)], alpha = 0.3) + #wes_palette("Rushmore1", 4, type = "discrete")[c(1)]
+  #facet_grid(. ~ sig_se) +
+  #scale_color_manual(values = wes_palette("BottleRocket2", 4, type = "discrete")) +
+  xlim(0,10) + ylim(-2.5,2.5) + 
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "black") +
+  labs(x = expression(paste("The severity of selective reporting")), y = expression(paste(" ", hat(beta),""[(MLMA)]~"-"~hat(beta),""[(FE~+~VCV)])), size = expression(italic(I)^2)) +
+  #guides(color = "none") +
+  #scale_x_continuous(limits = c(0,3)) +
+  #scale_y_continuous(limits = c(0,3)) +
+  theme_bw() +
+  guides(color = guide_legend(title = "Effect size measures"),
+         shape = guide_legend(title = "Mean effects")) +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=12),
+        legend.text = element_text(size=12),
+        strip.background = element_rect(fill = "transparent"),
+        strip.text = element_text(size = 12),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + # theme(legend.position = "top")
+  annotate("text", x = 5, y = 2, label = "Selective reporting", color = "red", fontface = "bold")
+D_vs._slope_SE3
+
+# without publication bias
+D_vs._slope_SE4 <- mod_stats2 %>% filter(sig_se == "No publicaiton bias") %>% 
+  ggplot(aes(x = beta_pb_flip, y = D2)) +
+  #geom_point(aes(color = es.type), alpha = 0.8) + 
+  #geom_point(color = wes_palette("Moonrise3", 4, type = "discrete")[2], alpha = 0.5) + 
+  geom_point(color = wes_palette("Rushmore1", 4, type = "discrete")[c(3)], alpha = 0.3) + # wes_palette("Rushmore1", 4, type = "discrete")[c(1)]
+  #facet_grid(. ~ sig_se) +
+  #scale_color_manual(values = wes_palette("BottleRocket2", 4, type = "discrete")) + 
+  xlim(-5,5) + ylim(-2.5,2.5) + 
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "black") + 
+  labs(x = expression(paste("The severity of selective reporting")), y = expression(paste(" ", hat(beta),""[(MLMA)]~"-"~hat(beta),""[(FE~+~VCV)])), size = expression(italic(I)^2)) +
+  #guides(color = "none") +
+  #scale_x_continuous(limits = c(0,3)) +
+  #scale_y_continuous(limits = c(0,3)) +
+  theme_bw() +
+  guides(color = guide_legend(title = "Effect size measures"),
+         shape = guide_legend(title = "Mean effects")) +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=10),
+        strip.background = element_rect(fill = "transparent"),
+        strip.text = element_text(size = 12),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + # theme(legend.position = "top")
+  annotate("text", x = 0, y = 2, label = "No selective reporting", color = "red", fontface = "bold")
+D_vs._slope_SE4
+dev.off()
+
+```
+
+
+# D_SE vs dependency
+
+The relationship between the difference in the estimated standard error of the mean effect sizes and the indicator of degree of statistical dependence (ICC).
+
+```{r}
+# degree of difference in SE
+# ICC vs. D
+# WLS
+mod_stats2 <- mod_stats2 %>% mutate(D_se = log(se_WLS) - log(se_MLMA)) # se_MLMA - se_WLS
+
+
+D_se_vs._ICC <- mod_stats2 %>% 
+  ggplot(aes(x = icc, y = D_se)) +
+  #geom_point(aes(color = es.type), alpha = 0.8) + 
+  geom_point(color = wes_palette("Moonrise3", 4, type = "discrete")[2], alpha = 0.5) + 
+  ylim(-5,0.5) + 
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "black") +
+  labs(x = expression(paste("The degree of statistical dependence (ICC)")), y = expression(paste("SE","(",hat(beta),""[(MLMA)],")"~"-"~"SE","(",hat(beta),""[(UWLS)],")"~"(log)")), size = expression(italic(I)^2)) +
+  theme_bw() +
+  guides(color = guide_legend(title = "Effect size measures"),
+         shape = guide_legend(title = "Mean effects")) +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=12),
+        legend.text = element_text(size=12),
+        strip.background = element_rect(fill = "transparent"),
+        strip.text = element_text(size = 12),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) +
+  annotate("text", x = 0.5, y = -0.0, label = "Before second-step CRVE", color = "red", fontface = "bold")
+
+ 
+# WLS + RVE
+mod_stats2 <- mod_stats2 %>% mutate(D_se2 = log(se_WLS_RVE) - log(se_MLMA)) # se_MLMA - se_WLS_RVE
+
+
+D_se_vs._ICC2 <- mod_stats2 %>% 
+  ggplot(aes(x = icc, y = D_se2)) +
+  #geom_point(aes(color = es.type), alpha = 0.8) + 
+  geom_point(color = wes_palette("Moonrise3", 4, type = "discrete")[2], alpha = 0.5) + 
+  ylim(-5,0.5) + 
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "black") +
+  labs(x = expression(paste("The degree of statistical dependence (ICC)")), y = expression(paste("SE","(",hat(beta),""[(MLMA)],")"~"-"~"SE","(",hat(beta),""[(UWLS + CRVE)],")"~"(log)")), size = expression(italic(I)^2)) +
+  theme_bw() +
+  guides(color = guide_legend(title = "Effect size measures"),
+         shape = guide_legend(title = "Mean effects")) +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=12),
+        legend.text = element_text(size=12),
+        strip.background = element_rect(fill = "transparent"),
+        strip.text = element_text(size = 12),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) +
+  annotate("text", x = 0.5, y = -0.0, label = "After second-step CRVE", color = "red", fontface = "bold")
+
+
+
+# MFEM 
+mod_stats2 <- mod_stats2 %>% mutate(D_se3 = log(se_MFEM) - log(se_MLMA)) # se_MLMA - se_MFEM
+
+D_se_vs._ICC3 <- mod_stats2 %>% #filter(log(D_se3) > -10) %>% 
+  ggplot(aes(x = icc, y = D_se3)) +
+  #geom_point(aes(color = es.type), alpha = 0.8) + 
+  geom_point(color = wes_palette("Moonrise3", 4, type = "discrete")[1], alpha = 0.5) + 
+  ylim(-5,0.5) +
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "black") +
+  labs(x = expression(paste("The degree of statistical dependence (ICC)")), y = expression(paste("SE","(",hat(beta),""[(MLMA)],")"~"-"~"SE","(",hat(beta),""[(FE ~ + ~ VCV)],")"~"(log)")), size = expression(italic(I)^2)) +
+  theme_bw() +
+  guides(color = guide_legend(title = "Effect size measures"),
+         shape = guide_legend(title = "Mean effects")) +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=12),
+        legend.text = element_text(size=12),
+        strip.background = element_rect(fill = "transparent"),
+        strip.text = element_text(size = 12),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) +
+  annotate("text", x = 0.5, y = -0.0, label = "Before second-step CRVE", color = "red", fontface = "bold")
+
+ 
+# MFEM + RVE
+mod_stats2 <- mod_stats2 %>% mutate(D_se4 = log(se_MFEM_RVE) - log(se_MLMA)) # se_MLMA - se_MFEM_RVE
+
+D_se_vs._ICC4 <- mod_stats2 %>% 
+  ggplot(aes(x = icc, y = D_se4)) +
+  #geom_point(aes(color = es.type), alpha = 0.8) + 
+  geom_point(color = wes_palette("Moonrise3", 4, type = "discrete")[1], alpha = 0.5) + 
+  ylim(-5,0.5) +
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "black") +
+  labs(x = expression(paste("The degree of statistical dependence (ICC)")), y = expression(paste("SE","(",hat(beta),""[(MLMA)],")"~"-"~"SE","(",hat(beta),""[(FE ~ + ~ VCV ~ + ~ CRVE)],")"~"(log)")), size = expression(italic(I)^2)) +
+  theme_bw() +
+  guides(color = guide_legend(title = "Effect size measures"),
+         shape = guide_legend(title = "Mean effects")) +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=12),
+        legend.text = element_text(size=12),
+        strip.background = element_rect(fill = "transparent"),
+        strip.text = element_text(size = 12),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) +
+  annotate("text", x = 0.5, y = -0.0, label = "After second-step CRVE", color = "red", fontface = "bold")
+
+```
+
+
+# Figs in MS
+
+Figures presented in main text.
+
+```{r}
+# fig2
+png(filename = "fig2.png", width = 8, height = 8, units = "in", type = "windows", res = 400)
+cowplot::plot_grid(as.ggplot(beta0_all_pb1.2), as.ggplot(beta0_all_pb0.2),
+                   as.ggplot(se_all_pb1.2), as.ggplot(se_all_pb0.2),
+                   labels = c('A', 'B', 'C', 'D'), label_size = 12, nrow = 2, ncol = 2) %>% suppressWarnings()
+dev.off()
+
+
+# fig5
+#png(filename = "fig5.png", width = 8, height = 4, units = "in", type = "windows", res = 400)
+#cowplot::plot_grid(se_all_pb1.2, se_all_pb0.2,labels = c('A', 'B'), label_size = 12,nrow = 1, ncol = 2)
+#dev.off()
+
+
+# fig3
+mod_stats2 <- readRDS(file = "mod_stats2.Rds")
+# beta0 - MLMA vs. UWLS
+df_2x2_spread <- data_2x2(
+  array_1 = filter(mod_stats2, sig_se == "Publication bias")$beta0_MLMA_flip,
+  array_2 = filter(mod_stats2, sig_se == "Publication bias")$beta0_WLS_flip,
+  array_3 = filter(mod_stats2, sig_se == "No publicaiton bias")$beta0_MLMA_flip,
+  array_4 = filter(mod_stats2, sig_se == "No publicaiton bias")$beta0_WLS_flip,
+  labels = (c('congruent','incongruent')),
+  jit_distance = .09,
+  jit_seed = 321,
+  spread_x_ticks = TRUE) 
+
+paired_beta0_MLMA_VS_WLS <- raincloud_2x2_repmes(
+  data = df_2x2_spread, # BottleRocket2
+  colors = wes_palette("Rushmore1", 4, type = "discrete")[c(4,3,4,3)],
+  fills = wes_palette("Rushmore1", 4, type = "discrete")[c(4,3,4,3)], # https://www.datanovia.com/en/blog/top-r-color-palettes-to-know-for-great-data-visualization/
+  line_color = 'gray',
+  line_alpha = .3,
+  size = 1,
+  alpha = .3,
+  spread_x_ticks = TRUE) +
+
+scale_x_continuous(breaks=c(1,2,3,4), labels=c("MLMA", "UWLS", "MLMA", "UWLS"), limits=c(0, 5)) +
+  xlab("First-step model") + 
+  ylab(expression(paste(hat(beta)))) +
+  ylim(-1,3) +
+  annotate(geom = "text", x= 1, y = -1, label = "Publication bias") +
+  annotate(geom = "text", x= 4, y = -1, label = "No publication bias") +
+  theme_classic() + 
+  theme(axis.text = element_text(size = 12), axis.title = element_text(size = 12)) 
+
+# beta0 - MLMA vs. MFEM (FE + VCV)
+df_2x2_spread <- data_2x2(
+  array_1 = filter(mod_stats2, sig_se == "Publication bias")$beta0_MLMA_flip,
+  array_2 = filter(mod_stats2, sig_se == "Publication bias")$beta0_MFEM_flip,
+  array_3 = filter(mod_stats2, sig_se == "No publicaiton bias")$beta0_MLMA_flip,
+  array_4 = filter(mod_stats2, sig_se == "No publicaiton bias")$beta0_MFEM_flip,
+  labels = (c('congruent','incongruent')),
+  jit_distance = .09,
+  jit_seed = 321,
+  spread_x_ticks = TRUE) 
+
+paired_beta0_MLMA_VS_MFEM <- raincloud_2x2_repmes(
+  data = df_2x2_spread,
+  colors = wes_palette("Rushmore1", 4, type = "discrete")[c(4,1,4,1)],
+  fills = wes_palette("Rushmore1", 4, type = "discrete")[c(4,1,4,1)], # https://www.datanovia.com/en/blog/top-r-color-palettes-to-know-for-great-data-visualization/
+  line_color = 'gray',
+  line_alpha = .3,
+  size = 1,
+  alpha = .3,
+  spread_x_ticks = TRUE) +
+
+scale_x_continuous(breaks=c(1,2,3,4), labels=c("MLMA", "FE + VCV", "MLMA", "FE + VCV"), limits=c(0, 5)) +
+  xlab("First-step model") + 
+  ylab(expression(paste(hat(beta)))) +
+  ylim(-1,3) +
+  annotate(geom = "text", x= 1, y = -1, label = "Publication bias") +
+  annotate(geom = "text", x= 4, y = -1, label = "No publication bias") +
+  theme_classic() + 
+  theme(axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12))
+
+
+png(filename = "fig3.png", width = 9, height = 4, units = "in", type = "windows", res = 400)
+cowplot::plot_grid(paired_beta0_MLMA_VS_WLS, paired_beta0_MLMA_VS_MFEM, labels = c('A', 'B'), label_size = 12,nrow = 1, ncol = 2)
+dev.off()
+
+
+
+# fig4
+png(filename = "fig4.png", width = 8, height = 7, units = "in", type = "windows", res = 400)
+cowplot::plot_grid(D_vs._slope_SE1, D_vs._slope_SE2, 
+                   D_vs._slope_SE3, D_vs._slope_SE4,
+                   labels = c('A', 'B', "C", "D"), label_size = 12, nrow = 2, ncol = 2) %>% suppressWarnings()
+dev.off()
+
+
+png(filename = "se_all2 (log).png", width = 8, height = 4, units = "in", type = "windows", res = 400)
+cowplot::plot_grid(se_all_pb1.2, se_all_pb0.2, labels = c('A', 'B'), label_size = 12,nrow = 1, ncol = 2)
+dev.off()
+
+
+
+
+# fig5
+png(filename = "fig5.png", width = 8, height = 7, units = "in", type = "windows", res = 400)
+cowplot::plot_grid(D_se_vs._ICC, D_se_vs._ICC2,
+                   D_se_vs._ICC3, D_se_vs._ICC4,
+                   labels = c('A', 'B', "C", "D"), 
+                   label_size = 12,nrow = 2, ncol = 2) %>% suppressWarnings()
+dev.off()
+
+
+
+```
+
+
+
+# Dataset characteristics
+
+```{r}
+# summarize dataset characteristics
+dat_list2 <- dat_list[names(dat_list) != "MA_35" & names(dat_list) != "MA_67" & names(dat_list) != "MA_185" & names(dat_list) != "MA_313" & names(dat_list) != "MA_324" & names(dat_list) != "MA_358" & names(dat_list) != "MA_359" & names(dat_list) != "MA_406" & names(dat_list) != "MA_433" & names(dat_list) != "MA_89" & names(dat_list) != "MA_92" & names(dat_list) != "MA_91" & names(dat_list) != "MA_177" & names(dat_list) != "MA_181" & names(dat_list) != "MA_194" & names(dat_list) != "MA_202" & names(dat_list) != "MA_416" &  names(dat_list) != "MA_432" & names(dat_list) != "MA_24" & names(dat_list) != "MA_88" & names(dat_list) != "MA_101"]
+
+
+
+
+# unlist
+dat_list2 <- plyr::ldply(dat_list2, data.frame)
+# how many es per study
+length(dat_list2$obs)/length(unique(dat_list2$study)) # 7.590292
+# how many cases with publication bias
+mod_stats2 <- readRDS(file = "mod_stats2.Rds")
+## alpha = 0.05
+tabyl(mod_stats2, sig_se) # count(mod_stats2, sig_se)
+## alpha = 0.1
+tabyl(mod_stats2, sig_se2)
+
+
+
+
+# how many meta-analysis having large beta0 from MLMA
+which((filter(mod_stats2, sig_se == "Publication bias")$D > 0)) %>% length() # 141
+nrow(filter(mod_stats2, sig_se == "Publication bias")) # 149
+141/149
+
+# how many meta-analysis having large SE from WLS and FE+VCV
+which((mod_stats2$se_WLS - mod_stats2$se_MLMA) < 0) %>% length() # 435
+nrow(mod_stats2) # 448
+435/448
+
+which((mod_stats2$se_MFEM - mod_stats2$se_MLMA) < 0) %>% length() # 428
+428/448
+
+```
+
+
+# MA of magnitude
+
+```{r}
+# calculate response ratio as effect size measure to quantify the difference between different models
+
+# WLS and MFEM
+mod_stats3 <- mod_stats2 %>% mutate(logRR_D = log(beta0_MLMA_flip / beta0_WLS_flip), # es for beta of MLMA VS. WLS
+                                    logRR_DV = ((study_N /2) * se_MLMA^2) / (beta0_MLMA_flip) + ((study_N /2) * se_WLS^2) / (beta0_WLS_flip), # var for beta of MLMA VS. WLS
+                                    logRR_D2 = log(beta0_MLMA_flip / beta0_MFEM_flip), # es for beta of MLMA VS. MFEM
+                                    logRR_D2V = ((study_N / 2) * se_MLMA^2) / (beta0_MLMA_flip) + ((study_N / 2) * se_MLMA^2) / (beta0_MLMA_flip), # var for beta of MLMA VS. MFEM
+                                    logVR_D_se = log(se_MLMA) - log(se_WLS), # es for se of MLMA VS. WLS
+                                    logVR_D_seV = 1 / (2 * (study_N/2 - 1)) + 1 / (2 * (study_N/2 - 1)), # var for se of MLMA VS. WLS
+                                    logVR_D_se2 = log(se_MLMA) - log(se_WLS_RVE), # es for se of MLMA VS. WLS_EVE
+                                    logVR_D_se2V = 1 / (2 * (study_N/2 - 1)) + 1 / (2 * (study_N/2 - 1)), # # var for se of MLMA VS. WLS_RVE
+                                    logVR_D_se3 = log(se_MLMA) - log(se_MFEM), # es for se of MLMA VS. MFEM
+                                    logVR_D_se3V = 1 / (2 * (study_N/2 - 1)) + 1 / (2 * (study_N/2 - 1)), # var for se of MLMA VS. MFEM
+                                    logVR_D_se4 = log(se_MLMA) - log(se_MFEM_RVE), # es for se of MLMA VS. MFEM_RVE
+                                    logVR_D_se4V = 1 / (2 * (study_N/2 - 1)) + 1 / (2 * (study_N/2 - 1)) # var for se of MLMA VS. MFEM_RVE
+                                    )
+
+
+# get folded mean and variance
+## beta for MLMA VS. WLS
+mod_stats3$logRR_D_folded <- folded_es(mean = mod_stats3$logRR_D, variance = mod_stats3$logRR_DV)
+mod_stats3$logRR_DV_folded <- folded_var(mean = mod_stats3$logRR_D, variance = mod_stats3$logRR_DV)
+## beta for MLMA VS. MFEM
+mod_stats3$logRR_D2_folded <- folded_es(mean = mod_stats3$logRR_D2, variance = mod_stats3$logRR_D2V)
+mod_stats3$logRR_D2V_folded <- folded_var(mean = mod_stats3$logRR_D2, variance = mod_stats3$logRR_D2V)
+
+## se for MLMA VS. WLS
+mod_stats3$logVR_D_se_folded <- folded_es(mean = mod_stats3$logVR_D_se, variance = mod_stats3$logVR_D_seV)
+mod_stats3$logVR_D_seV_folded <- folded_var(mean = mod_stats3$logVR_D_se, variance = mod_stats3$logVR_D_seV)
+## se for MLMA VS. WLS_RVE
+mod_stats3$logVR_D_se2_folded <- folded_es(mean = mod_stats3$logVR_D_se2, variance = mod_stats3$logVR_D_se2V)
+mod_stats3$logVR_D_se2V_folded <- folded_var(mean = mod_stats3$logVR_D_se2, variance = mod_stats3$logVR_D_se2V)
+## se for MLMA VS. MFEM
+mod_stats3$logVR_D_se3_folded <- folded_es(mean = mod_stats3$logVR_D_se3, variance = mod_stats3$logVR_D_se3V)
+mod_stats3$logVR_D_se3V_folded <- folded_var(mean = mod_stats3$logVR_D_se3, variance = mod_stats3$logVR_D_se3V)
+## se for MLMA VS. MFEM_RVE
+mod_stats3$logVR_D_se4_folded <- folded_es(mean = mod_stats3$logVR_D_se4, variance = mod_stats3$logVR_D_se4V)
+mod_stats3$logVR_D_se4V_folded <- folded_var(mean = mod_stats3$logVR_D_se4, variance = mod_stats3$logVR_D_se4V)
+
+
+
+# overall magnitude of D
+## beta for MLMA VS. WLS
+MMA_D <- rma.mv(yi = logRR_D_folded, V = logRR_DV_folded, random = list(~1 | MA_case), test = "t", method = "REML", data = mod_stats3, digits = 3) # mods = ~ beta_pb_flip
+rma(yi = logRR_D_folded, vi = logRR_DV_folded, method = "REML", data = mod_stats3, weights = study_N)
+rma(yi = logRR_D, vi = logRR_DV, method = "REML", data = mod_stats3, weights = study_N)
+
+## beta for MLMA VS. MFEM
+MMA_D2 <- rma.mv(yi = logRR_D2_folded, V = logRR_D2V_folded, random = list(~1 | MA_case), test = "t", method = "REML", data = mod_stats3, digits = 3)
+rma(yi = logRR_D2_folded, vi = logRR_D2V_folded, method = "REML", data = mod_stats3, weights = study_N)
+rma(yi = logRR_D2, vi = logRR_D2V, method = "REML", data = mod_stats3, weights = study_N)
+
+## D vs. publication bias slope
+MMA_D_VS_pb <- rma.mv(yi = logRR_D_folded, V = logRR_DV_folded, mods = ~ beta_pb_flip, random = list(~1 | MA_case), test = "t", method = "REML", data = mod_stats3, digits = 3)
+MMA_D2_VS_pb <- rma.mv(yi = logRR_D2_folded, V = logRR_D2V_folded, mods = ~ beta_pb_flip, random = list(~1 | MA_case), test = "t", method = "REML", data = mod_stats3, digits = 3)
+
+
+## se for MLMA VS. WLS
+MMA_D_se <- rma.mv(yi = logVR_D_se_folded, V = logVR_D_seV_folded, random = list(~1 | MA_case), test = "t", method = "REML", data = mod_stats3, digits = 3) 
+## se for MLMA VS. WLS_RVE
+MMA_D_se2 <- rma.mv(yi = logVR_D_se2_folded, V = logVR_D_se2V_folded, random = list(~1 | MA_case), test = "t", method = "REML", data = mod_stats3, digits = 3)
+## se for MLMA VS. MFEM
+MMA_D_se3 <- rma.mv(yi = logVR_D_se3_folded, V = logVR_D_se3V_folded, random = list(~1 | MA_case), test = "t", method = "REML", data = mod_stats3, digits = 3)
+## se for MLMA VS. MFEM_RVE
+MMA_D_se4 <- rma.mv(yi = logVR_D_se4_folded, V = logVR_D_se4V_folded, random = list(~1 | MA_case), test = "t", method = "REML", data = mod_stats3, digits = 3)
+
+
+
+## D_se vs. ICC
+MMA_D_se_VS_icc <- rma.mv(yi = logVR_D_se_folded, V = logVR_D_seV_folded, mods = ~ icc, random = list(~1 | MA_case), test = "t", method = "REML", data = mod_stats3) 
+MMA_D_se2_VS_icc <- rma.mv(yi = logVR_D_se2_folded, V = logVR_D_se2V_folded, mods = ~ icc, random = list(~1 | MA_case), test = "t", method = "REML", data = mod_stats3) 
+MMA_D_se3_VS_icc <- rma.mv(yi = logVR_D_se3_folded, V = logVR_D_se3V_folded, mods = ~ icc, random = list(~1 | MA_case), test = "t", method = "REML", data = mod_stats3) 
+MMA_D_se4_VS_icc <- rma.mv(yi = logVR_D_se4_folded, V = logVR_D_se4V_folded, mods = ~ icc, random = list(~1 | MA_case), test = "t", method = "REML", data = mod_stats3) 
+
+# non folded
+rma.mv(yi = logVR_D_se, V = logVR_D_seV, random = list(~1 | MA_case), test = "t", method = "REML", data = mod_stats3[is.finite(mod_stats3$logVR_D_se) & is.finite(mod_stats3$logVR_D_seV),])
+rma(yi = logVR_D_se, vi = logVR_D_seV, test = "t", method = "REML", data = mod_stats3[is.finite(mod_stats3$logVR_D_se) & is.finite(mod_stats3$logVR_D_seV),], weights = study_N)
+
+
+rma.mv(yi = logVR_D_se2, V = logVR_D_se2V, random = list(~1 | MA_case), test = "t", method = "REML", data = mod_stats3[is.finite(mod_stats3$logVR_D_se2) & is.finite(mod_stats3$logVR_D_se2V),])
+rma(yi = logVR_D_se2, vi = logVR_D_se2V, test = "t", method = "REML", data = mod_stats3[is.finite(mod_stats3$logVR_D_se2) & is.finite(mod_stats3$logVR_D_se2V),], weights = study_N)
+
+
+rma.mv(yi = logVR_D_se3, V = logVR_D_se3V, random = list(~1 | MA_case), test = "t", method = "REML", data = mod_stats3[is.finite(mod_stats3$logVR_D_se3) & is.finite(mod_stats3$logVR_D_se3V),])
+rma(yi = logVR_D_se3, vi = logVR_D_se3V, test = "t", method = "REML", data = mod_stats3[is.finite(mod_stats3$logVR_D_se3) & is.finite(mod_stats3$logVR_D_se3V),], weights = study_N)
+
+rma.mv(yi = logVR_D_se4, V = logVR_D_se4V, random = list(~1 | MA_case), test = "t", method = "REML", data = mod_stats3[is.finite(mod_stats3$logVR_D_se4) & is.finite(mod_stats3$logVR_D_se4V),])
+rma(yi = logVR_D_se4, vi = logVR_D_se4V, method = "REML", data = mod_stats3[is.finite(mod_stats3$logVR_D_se4) & is.finite(mod_stats3$logVR_D_se4V),], weights = study_N)
+
+
+# overall decline in different effect size measures
+# reorder the level of effect size types
+model_est_all_original$es_type <- factor(model_est_all_original$es_type, levels = c("Zr", "SMD", "lnRR"))
+
+MMA_beta0_all_original_es_type <- rma.mv(yi = beta0_folded, V = beta0_var_folded, random = list(~1 | MA, ~1 | case), mods = ~ es_type - 1, method = "REML", test = "t", data = model_est_all_original)
+
+# orchard for overall decline in effect size magnitude for effect size measures
+png(filename = "./orchard_MMA_beta0_all_original_es_type.png", width = 6, height = 3.5, units = "in", res = 400, type = "windows")
+orchard_MMA_beta0_all_original_es_type <- orchard_plot(MMA_beta0_all_original_es_type, 
+             data = model_est_all_original,
+             mod = "es_type", group = "case", 
+             k = FALSE, g = FALSE,
+             trunk.size = 1, branch.size = 1, twig.size = 0.5,
+             xlab = "Overall mean",
+             transfm = "none", 
+             angle = 90) +
+scale_x_discrete(labels = c("Zr", "SMD", "lnRR")) + 
+scale_fill_manual(values = c("#CC6677", "#DDCC77", "#117733")) +
+scale_color_manual(values = c("#CC6677", "#DDCC77", "#117733")) +
+theme(axis.text.x = element_text(size = 10, colour = "black"),
+      axis.text.y = element_text(size = 10, colour = "black"),
+      axis.title.x = element_text(size = 10, colour = "black"),
+      plot.title = element_text(size = 10, colour = "black"))
+orchard_MMA_beta0_all_original_es_type
+dev.off()
+
+
+# assemble panels
+png(filename = "./orchard_MMA_beta0_original_assemble.png", width = 5, height = 5, units = "in", res = 400, type = "windows")
+plot_grid(orchard_MMA_beta0_all_original, orchard_MMA_beta0_all_original_es_type, labels = c("A","B"), nrow = 2)
+dev.off()
+
+
+
+# paired plot
+dummy <- rep("Dummy", nrow(model_est_all_scaled))
+wide.data <- 
+  tibble::tibble(
+    `Overall mean` = abs(model_est_all_scaled$beta0),
+    `Bias-corrected mean` = abs(model_est_all_scaled$beta0_c),
+     Dummy = dummy, ID = 1:length(dummy), case = model_est_all_scaled$case,es_type = model_est_all_scaled$es_type)
+
+## find correct direction of slope
+include.point <- which((wide.data$`Overall mean` - wide.data$`Bias-corrected mean`)>0)
+## table only includes correct data
+wide.data2 <- wide.data[include.point,]
+
+
+# use ggpaired() in ggpubr to show the pairwise comparisons 
+## lnRR
+png(filename = "./paired.plot_lnRR.png", width = 5, height = 5, units = "in", type = "windows", res = 400)
+paired.plot_lnRR <- ggpaired(data = wide.data2 %>% filter(es_type=="lnRR"), cond1 = "Overall mean", cond2 = "Bias-corrected mean",fill = "condition", palette = "jco") + 
+  scale_y_continuous(limits = c(0,1)) +
+  scale_fill_manual(values = c("#E69F00", "#56B4E9")) + 
+  guides(fill = "none") + labs(x = "", y = "Effect size estimate of lnRR")
+paired.plot_lnRR
+dev.off()
+
+## SMD
+png(filename = "./paired.plot_SMD.png", width = 5, height = 5, units = "in", type = "windows", res = 400)
+paired.plot_SMD <- ggpaired(data = wide.data2 %>% filter(es_type=="SMD"), cond1 = "Overall mean", cond2 = "Bias-corrected mean",fill = "condition", palette = "jco") + 
+  scale_y_continuous(limits = c(0,1)) +
+  scale_fill_manual(values = c("#009E73", "#CC79A7")) + 
+  guides(fill = "none") + labs(x = "", y = "Effect size estimate of SMD")
+paired.plot_SMD
+dev.off()
+
+## Zr
+png(filename = "./paired.plot_Zr.png", width = 5, height = 5, units = "in", type = "windows", res = 400)
+paired.plot_Zr <- ggpaired(data = wide.data2 %>% filter(es_type=="Zr"), cond1 = "Overall mean", cond2 = "Bias-corrected mean",fill = "condition", palette = "jco") + 
+  scale_y_continuous(limits = c(0,1)) +
+  scale_fill_manual(values = c("#0072B2", "#D55E00")) + 
+  guides(fill = "none") + labs(x = "", y = "Effect size estimate of Zr")
+paired.plot_Zr
+dev.off()
+
+## put together
+png(filename = "./paired.plot3.png", width = 4, height = 8, units = "in", type = "windows", res = 400)
+plot_grid(paired.plot_lnRR,paired.plot_SMD,paired.plot_Zr,ncol = 1)
+dev.off()
+```
+
+# Displays in SI
+
+These figures and tables are shown in supplementary material
+
+## Table S1
+
+```{r}
+
+t1 <- mod_stats2 %>% select(MA_case,beta0_MLMA,beta0_WLS,beta0_WLS_RVE,beta0_FE,beta0_FE_RVE,beta0_MFEM,beta0_MFEM_RVE,se_MLMA,se_WLS,se_WLS_RVE,se_FE,se_FE_RVE,se_MFEM,se_MFEM_RVE,No.,obs_N,study_N,es.type)
+
+t1 <- t1[,c(16,1,17:19,2:15)]
+t1 <- metafor::dfround(t1,3)
+
+write.csv(t1, file = "Supplementary Table 1.csv", row.names = F) 
+
+```
+
+## Figure S1
+
+Sensitivity analyses.
+
+```{r}
+mod_stats2_beta0 <- mod_stats2 %>%
+  select(MA_case, beta0_MLMA_flip, beta0_PETPEESE_flip, beta0_MFEM_flip, sig_se2, sig_beta0, study_N) %>%
+  pivot_longer(cols = c(beta0_PETPEESE_flip, beta0_MFEM_flip),
+               names_to = "estimator_alternative", values_to = "beta0_alternative") 
+# %>% mutate(estimator_alternative = gsub("[0-9]+", "", estimator_alternative))
+
+names(mod_stats2_beta0)[names(mod_stats2_beta0) == "beta0_MLMA_flip"] <- c("beta0")
+
+mod_stats2_beta0$estimator_alternative <- as.factor(mod_stats2_beta0$estimator_alternative)
+
+mod_stats2_beta0$estimator_alternative <- factor(mod_stats2_beta0$estimator_alternative, levels = c("beta0_PETPEESE_flip", "beta0_MFEM_flip"))
+
+
+# with marginal distribution
+## recode
+mod_stats2_beta0 <- mod_stats2_beta0 %>% mutate(estimator_alternative=dplyr::recode(estimator_alternative, 'beta0_PETPEESE_flip'='PET-PEESE', 'beta0_MFEM_flip'='FE + VCV'))
+
+
+# with publication bias 
+beta0_all_pb1 <- mod_stats2_beta0 %>% filter(sig_se2 == "Publication bias" & sig_beta0 == "True effect" & study_N > 20) %>% 
+  ggplot(aes(x = beta0, y = beta0_alternative)) +
+  #geom_point(aes(size = M1s), alpha = 0.5, color = "#0072B2", fill = "#0072B2") 
+  geom_point(aes(color = estimator_alternative, fill = estimator_alternative), alpha = 0.8) +
+  #facet_grid(. ~ sig_se) +
+  #facet_grid(. ~ sig_beta0) +
+  #viridis::scale_color_viridis(discrete = T) + 
+  scale_color_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) + #  BottleRocket2
+  scale_fill_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) +
+  #scale_fill_manual(values = wes_palette("GrandBudapest2", 4, type = "discrete")) +
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "red") +
+  #stat_regline_equation(label.y = 3.5, aes(label = ..eq.label..)) +
+  #scale_color_hue(labels = c("UWLS", "MFEM", "LMEM")) + # editing legend (text) labels - https://stackoverflow.com/questions/23635662/editing-legend-text-labels-in-ggplot
+  geom_abline(intercept = 0, slope = 1, colour= 'black', linetype = "dashed") + 
+  labs(x = expression(paste(hat(beta),""[(MLMA)] ~ "(Benchmark)")), y = expression(paste(hat(beta),""[] ~ "(Bias-robust)")), size = expression(italic(I)^2)) +
+  guides(color = guide_legend(title = "Estimator"), fill = "none") +
+  scale_x_continuous(limits = c(-1,3)) +
+  scale_y_continuous(limits = c(-1,3)) +
+  theme_bw() +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = 0.5, y = 2.0, label = "Selective reporting \n (α = 0.1)", color = "red", fontface = "bold") 
+
+# marginal # https://github.com/daattali/ggExtra
+#beta0_all_pb1.2 <- ggExtra::ggMarginal(beta0_all_pb1, groupColour = TRUE, groupFill = TRUE)
+
+# keep original legend
+options("aplot_guides" = "keep") # https://github.com/YuLab-SMU/aplot/issues/6
+
+
+top.dist_beta0_all_pb1 <- mod_stats2_beta0 %>% filter(sig_se2 == "Publication bias" & sig_beta0 == "True effect" & study_N > 20) %>%
+  ggplot(aes(x = beta0)) + 
+  geom_density(color = wes_palette("Rushmore1", 4, type = "discrete")[4], fill=wes_palette("Rushmore1", 4, type = "discrete")[4], alpha = 0.8) + 
+  scale_x_continuous(limits = c(-1,3), expand = expansion(mult = c(0, 0.01))) +
+  labs(x = "", y = "") + 
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+right.dist_beta0_all_pb1 <- mod_stats2_beta0 %>% filter(sig_se2 == "Publication bias" & sig_beta0 == "True effect" & study_N > 20) %>%
+  ggplot(aes(x = beta0_alternative, color = estimator_alternative, fill = estimator_alternative)) + 
+  geom_density(alpha = 0.8) +
+  scale_color_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) + 
+  scale_fill_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) +
+  scale_x_continuous(limits = c(-1,3), expand = expansion(mult = c(0, 0.01))) +
+  guides(fill = "none", color = "none") +
+  labs(x = "", y = "") + 
+  coord_flip() +
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+beta0_all_pb1.2 <- suppressMessages(beta0_all_pb1 %>% 
+  insert_top(top.dist_beta0_all_pb1, height=.3) %>% 
+  insert_right(right.dist_beta0_all_pb1, width=.3)) # print(beta0_all_pb1.2) & theme(legend.position="bottom")
+
+
+# without publication bias
+beta0_all_pb0 <- mod_stats2_beta0 %>% filter(sig_se2 == "No publicaiton bias" & sig_beta0 == "True effect" & study_N > 20) %>% 
+  ggplot(aes(x = beta0, y = beta0_alternative)) +
+  #geom_point(aes(size = M1s), alpha = 0.5, color = "#0072B2", fill = "#0072B2") 
+  geom_point(aes(color = estimator_alternative, fill = estimator_alternative), alpha = 0.8) +
+  #facet_grid(. ~ sig_se) +
+  #facet_grid(. ~ sig_beta0) +
+  theme_bw() +
+  #viridis::scale_color_viridis(discrete = T) + 
+  scale_color_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) +
+  scale_fill_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) +
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "red") +
+  #stat_regline_equation(label.y = 3.5, aes(label = ..eq.label..)) +
+  #scale_color_hue(labels = c("UWLS", "MFEM", "LMEM")) + # editing legend (text) labels - https://stackoverflow.com/questions/23635662/editing-legend-text-labels-in-ggplot
+  geom_abline(intercept = 0, slope = 1, colour= 'black', linetype = "dashed") + 
+  labs(x = expression(paste(hat(beta),""[(MLMA)] ~ "(Benchmark)")), y = expression(paste(hat(beta),""[] ~ "(Bias-robust)")), size = expression(italic(I)^2), parse = TRUE) +
+  guides(color = guide_legend(title = "Estimator"), fill = "none") +
+  scale_x_continuous(limits = c(-1,3)) +
+  scale_y_continuous(limits = c(-1,3)) +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = 0.5, y = 2.0, label = "No selective reporting \n (α = 0.1)", color = "red", fontface = "bold") 
+
+#beta0_all_pb0.2 <- ggExtra::ggMarginal(beta0_all_pb0, groupColour = TRUE, groupFill = TRUE)
+
+# keep original legend
+options("aplot_guides" = "keep") # https://github.com/YuLab-SMU/aplot/issues/6
+
+top.dist_beta0_all_pb0 <- mod_stats2_beta0 %>% filter(sig_se2 == "No publicaiton bias" & sig_beta0 == "True effect" & study_N > 20) %>%
+  ggplot(aes(x = beta0)) + 
+  geom_density(color = wes_palette("Rushmore1", 4, type = "discrete")[4], fill=wes_palette("Rushmore1", 4, type = "discrete")[4], alpha = 0.8) + 
+  scale_x_continuous(limits = c(-1,3), expand = expansion(mult = c(0, 0.01))) +
+  labs(x = "", y = "") + 
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+right.dist_beta0_all_pb0 <- mod_stats2_beta0 %>% filter(sig_se2 == "No publicaiton bias" & study_N > 20) %>%
+  ggplot(aes(x = beta0_alternative, color = estimator_alternative, fill = estimator_alternative)) + 
+  geom_density(alpha = 0.8) +
+  scale_color_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) + 
+  scale_fill_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) +
+  scale_x_continuous(limits = c(-1,3), expand = expansion(mult = c(0, 0.01))) +
+  guides(fill = "none", color = "none") +
+  labs(x = "", y = "") + 
+  coord_flip() +
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+beta0_all_pb0.2 <- suppressMessages(beta0_all_pb0 %>% 
+  insert_top(top.dist_beta0_all_pb0, height=.3) %>% 
+  insert_right(right.dist_beta0_all_pb0, width=.3)) 
+
+#as.ggplot(beta0_all_pb1.2) + as.ggplot(beta0_all_pb0.2) + plot_layout(ncol = 2, nrow = 1)
+
+
+
+#------------------------------------------------------------------#
+# convert se_beta0
+mod_stats2_se <- mod_stats2 %>%
+  select(MA_case, se_MLMA, se_MFEM, se_MFEM_RVE, sig_se2, sig_beta0, study_N) %>%
+  pivot_longer(cols = c(se_MFEM, se_MFEM_RVE),
+               names_to = "estimator_alternative", values_to = "se_alternative") 
+names(mod_stats2_se)[names(mod_stats2_se) == "se_MLMA"] <- c("se")
+
+mod_stats2_se$estimator_alternative <- as.factor(mod_stats2_se$estimator_alternative)
+
+mod_stats2_se$estimator_alternative <- factor(mod_stats2_se$estimator_alternative, levels = c("se_MFEM", "se_MFEM_RVE"))
+
+# recode
+mod_stats2_se <- mod_stats2_se %>% mutate(estimator_alternative=dplyr::recode(estimator_alternative, 'se_MFEM'='FE + VCV' , "se_MFEM_RVE" = "FE + VCV + CRVE"))
+
+# add whether using RVE
+mod_stats2_se$RVE <- rep(c("Before", "After"), 448) # nrow(mod_stats2) = 448 or nrow(mod_stats2_se)/4
+
+  
+# se_beta0 (log scale)
+# before CRVE
+se_all_pb1 <- mod_stats2_se %>% filter(RVE == "Before" & sig_beta0 == "True effect" & sig_se2 == "Publication bias" & study_N > 20) %>%  
+  ggplot(aes(x = log(se), y = log(se_alternative))) +
+  geom_point(aes(color = estimator_alternative), alpha = 0.8) +
+  scale_color_manual(values = wes_palette("Moonrise3", 4, type = "discrete")[2]) +
+  scale_fill_manual(values = wes_palette("Moonrise3", 4, type = "discrete")[2]) +
+  geom_abline(intercept = 0, slope = 1, colour= 'black', linetype = "dashed") + 
+  labs(x = expression(paste("SE","(",hat(beta),""[(MLMA)],")" ~ "(Benchmark) (log)")), y = expression(paste("SE","(",hat(beta),""[],")" ~ "(Naive variance) (log)")), size = expression(italic(I)^2)) + 
+  guides(color = guide_legend(title = "Estimator"), fill = "none") +
+  scale_x_continuous(limits = c(-5,0)) +
+  scale_y_continuous(limits = c(-5,0)) +
+  theme_bw() +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = -3.0, y = -0.7, label = "Before CRVE", color = "red", fontface = "bold")
+#se_all_pb1.2 <- ggExtra::ggMarginal(se_all_pb1, groupColour = TRUE, groupFill = TRUE)
+
+
+# keep original legend
+options("aplot_guides" = "keep")
+
+top.dist_se_all_pb1 <- mod_stats2_se %>% filter(RVE == "Before" & sig_beta0 == "True effect" & sig_se2 == "Publication bias" & study_N > 20) %>%
+  ggplot(aes(x = log(se))) + 
+  geom_density(color = wes_palette("Moonrise3", 4, type = "discrete")[1], fill = wes_palette("Moonrise3", 4, type = "discrete")[1], alpha = 0.8) + 
+  scale_x_continuous(limits =  c(-5,0), expand = expansion(mult = c(0, 0.01))) +
+  labs(x = "", y = "") + 
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+right.dist_se_all_pb1 <- mod_stats2_se %>% filter(RVE == "Before" & sig_beta0 == "True effect" & sig_se2 == "Publication bias" & study_N > 20) %>%
+  ggplot(aes(x = log(se_alternative))) + 
+  geom_density(color = wes_palette("Moonrise3", 4, type = "discrete")[2], fill = wes_palette("Moonrise3", 4, type = "discrete")[2], alpha = 0.8) + 
+  scale_x_continuous(limits =  c(-5,0), expand = expansion(mult = c(0, 0.01))) +
+  coord_flip() +
+  labs(x = "", y = "") + 
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+se_all_pb1.2 <- suppressMessages(se_all_pb1 %>% 
+  insert_top(top.dist_se_all_pb1, height=.3) %>% 
+  insert_right(right.dist_se_all_pb1, width=.3)) 
+
+
+# after CRVE
+se_all_pb0 <- mod_stats2_se %>% filter(RVE == "After" & sig_beta0 == "True effect" & sig_se2 == "No publicaiton bias" & study_N > 20) %>% 
+  ggplot(aes(x = log(se), y = log(se_alternative))) +
+  geom_point(aes(color = estimator_alternative, fill = estimator_alternative), alpha = 0.8) +
+  scale_color_manual(values = wes_palette("Moonrise3", 4, type = "discrete")[2]) +
+  scale_fill_manual(values = wes_palette("Moonrise3", 4, type = "discrete")[2]) +
+  geom_abline(intercept = 0, slope = 1, colour= 'black', linetype = "dashed") + 
+  labs(x = expression(paste("SE","(",hat(beta),""[(MLMA)],")" ~ "(Benchmark) (log)")), y = expression(paste("SE","(",hat(beta),""[],")" ~ "(Variance-robust) (log)")), size = expression(italic(I)^2)) + 
+  guides(color = guide_legend(title = "Estimator"), fill = "none") +
+  scale_x_continuous(limits = c(-5,0)) +
+  scale_y_continuous(limits = c(-5,0)) +
+  theme_bw() +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = -3.0, y = -0.7, label = "After CRVE", color = "red", fontface = "bold")
+#se_all_pb0.2 <- ggExtra::ggMarginal(se_all_pb0, groupColour = TRUE, groupFill = TRUE)
+
+top.dist_se_all_pb0 <- mod_stats2_se %>% filter(RVE == "After" & sig_beta0 == "True effect" & sig_se2 == "Publication bias") %>%
+  ggplot(aes(x = log(se))) + 
+  geom_density(color = wes_palette("Moonrise3", 4, type = "discrete")[1], fill = wes_palette("Moonrise3", 4, type = "discrete")[1], alpha = 0.8) + 
+  scale_x_continuous(limits =  c(-5,0), expand = expansion(mult = c(0, 0.01))) +
+  labs(x = "", y = "") + 
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+right.dist_se_all_pb0 <- mod_stats2_se %>% filter(RVE == "After" & sig_beta0 == "True effect" & sig_se2 == "Publication bias" & study_N > 20) %>%
+  ggplot(aes(x = log(se_alternative))) + 
+  geom_density(color = wes_palette("Moonrise3", 4, type = "discrete")[2], fill = wes_palette("Moonrise3", 4, type = "discrete")[2], alpha = 0.8) + 
+  scale_x_continuous(limits =  c(-5,0), expand = expansion(mult = c(0, 0.01))) +
+  coord_flip() +
+  labs(x = "", y = "") + 
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+se_all_pb0.2 <- suppressMessages(se_all_pb0 %>% 
+  insert_top(top.dist_se_all_pb0, height=.3) %>% 
+  insert_right(right.dist_se_all_pb0, width=.3)) 
+
+
+png(filename = "figS1.png", width = 8, height = 8, units = "in", type = "windows", res = 400)
+cowplot::plot_grid(as.ggplot(beta0_all_pb1.2), as.ggplot(beta0_all_pb0.2),
+                   as.ggplot(se_all_pb1.2), as.ggplot(se_all_pb0.2),
+                   labels = c('A', 'B', 'C', 'D'), label_size = 12, nrow = 2, ncol = 2) %>% suppressWarnings()
+dev.off()
+
+```
+
+
+## Figure S2
+
+Slit the dataset according to effect size measures and comparing the estimated population mean effect size estimates.
+
+```{r}
+# WLS
+mod_stats2 <- mod_stats2 %>% mutate(D = beta0_MLMA_flip - beta0_WLS_flip)
+mod_stats2$es.type <- as.factor(mod_stats2$es.type)
+mod_stats2$es.type <- factor(mod_stats2$es.type, levels = c("SMD", "lnRR", "Zr", "uncommon"))
+#mod_stats2$sig_pb <- as.factor(mod_stats2$sig_pb)
+#mod_stats2$sig_pb <- factor(mod_stats2$sig_pb, levels = c("Yes", "No"))
+
+# https://rpkgs.datanovia.com/ggpubr/reference/ggviolin.html
+
+# https://rpkgs.datanovia.com/ggpubr/reference/ggviolin.html
+# split by publication bias
+figS2.1 <- ggviolin(mod_stats2, "es.type", "D", color = "sig_se", 
+   palette = wes_palette("Royal2", 2, type = "discrete"),
+   add = "boxplot", add.params = list(fill = "white")) + 
+   guides(color = guide_legend(title = "")) + 
+   theme(legend.background = element_rect(color = "transparent"),
+         legend.key=element_rect(color="transparent")) + 
+   labs(x = "Effect size measures", y = expression(paste( beta[0],""[(MLRE)]~"-"~beta,""[(UWLS)])))
+
+
+# MFEM
+mod_stats2 <- mod_stats2 %>% mutate(D2 = beta0_MLMA_flip - beta0_MFEM_flip)
+mod_stats2$es.type <- as.factor(mod_stats2$es.type)
+mod_stats2$es.type <- factor(mod_stats2$es.type, levels = c("SMD", "lnRR", "Zr", "uncommon"))
+#mod_stats2$sig_pb <- as.factor(mod_stats2$sig_pb)
+#mod_stats2$sig_pb <- factor(mod_stats2$sig_pb, levels = c("Yes", "No"))
+
+# https://rpkgs.datanovia.com/ggpubr/reference/ggviolin.html
+
+# https://rpkgs.datanovia.com/ggpubr/reference/ggviolin.html
+# split by publication bias
+figS2.2 <- ggviolin(mod_stats2, "es.type", "D", color = "sig_se", 
+   palette = wes_palette("Royal2", 2, type = "discrete"),
+   add = "boxplot", add.params = list(fill = "white")) + 
+   guides(color = guide_legend(title = "")) + 
+   theme(legend.background = element_rect(color = "transparent"),
+         legend.key=element_rect(color="transparent")) + 
+   labs(x = "Effect size measures", y = expression(paste( beta[0],""[(MLRE)]~"-"~beta,""[(FE + VCV)]))) # how to add 0 as subscript -  labs(x = "Effect size measures", y = expression(paste( beta[0],""[(MLRE)]~"-"~beta[0],""[(FE + VCV)])))
+
+
+png(filename = "./figS2.png", width = 8, height = 8, units = "in", type = "windows", res = 400)
+cowplot::plot_grid(figS2.1, figS2.2,
+                   labels = c('A', 'B'), label_size = 12, nrow = 2, ncol = 1) %>% suppressWarnings()
+dev.off()
+```
+
+
+## Figure S3
+
+Sensitivity analyses corresponding to Figure 4 in the main text.
+
+```{r}
+# slope of publication bias vs. D
+mod_stats2 <- mod_stats2 %>% mutate(D = beta0_MLMA_flip - beta0_WLS_flip)
+# flipping sign of slope of SE if beta0 was negative
+mod_stats2 <- mod_stats2 %>% mutate(beta_pb_flip = base::ifelse(beta0_MLMA < 0, beta_pb*(-1), beta_pb))
+
+mod_stats2$sig_se2 <- as.factor(mod_stats2$sig_se2)
+mod_stats2$sig_se2 <- factor(mod_stats2$sig_se2, levels = c("Publication bias", "No publicaiton bias"))
+
+# with publication bias
+D_vs._slope2_SE1 <- mod_stats2 %>% filter(sig_se2 == "Publication bias") %>% 
+  ggplot(aes(x = beta_pb_flip, y = D)) +
+  #geom_point(aes(color = es.type), alpha = 0.8) + 
+  geom_point(color = wes_palette("Rushmore1", 4, type = "discrete")[c(3)], alpha = 0.3) + 
+  #facet_grid(. ~ sig_se) +
+  #scale_color_manual(values = wes_palette("BottleRocket2", 4, type = "discrete")) +
+  xlim(0,10) + ylim(-2.5,2.5) + 
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "black") +
+  labs(x = expression(paste("The severity of publication bias")), y = expression(paste(" ", hat(beta),""[(MLMA)]~"-"~hat(beta),""[(UWLS)])), size = expression(italic(I)^2)) +
+  #guides(color = "none") +
+  #scale_x_continuous(limits = c(0,3)) +
+  #scale_y_continuous(limits = c(0,3)) +
+  theme_bw() +
+  guides(color = guide_legend(title = "Effect size measures"),
+         shape = guide_legend(title = "Mean effects")) +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=12),
+        legend.text = element_text(size=12),
+        strip.background = element_rect(fill = "transparent"),
+        strip.text = element_text(size = 12),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + # theme(legend.position = "top")
+  annotate("text", x = 5, y = 2, label = expression(paste("Publication bias" ~ "(", alpha ~ "=" ~ "0.1", ")")), color = "red", fontface = "bold")
+
+
+
+# without publication bias
+D_vs._slope2_SE2 <- mod_stats2 %>% filter(sig_se2 == "No publicaiton bias") %>% 
+  ggplot(aes(x = beta_pb_flip, y = D)) +
+  #geom_point(aes(color = es.type), alpha = 0.8) + 
+  geom_point(color = wes_palette("Rushmore1", 4, type = "discrete")[c(3)], alpha = 0.3) + 
+  #facet_grid(. ~ sig_se) +
+  #scale_color_manual(values = wes_palette("BottleRocket2", 4, type = "discrete")) +
+  xlim(-5,5) + ylim(-2.5,2.5) + 
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "black") +
+  labs(x = expression(paste("The severity of publication bias")), y = expression(paste(" ", hat(beta),""[(MLMA)]~"-"~hat(beta),""[(UWLS)])), size = expression(italic(I)^2)) +
+  #guides(color = "none") +
+  #scale_x_continuous(limits = c(0,3)) +
+  #scale_y_continuous(limits = c(0,3)) +
+  theme_bw() +
+  guides(color = guide_legend(title = "Effect size measures"),
+         shape = guide_legend(title = "Mean effects")) +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=12),
+        legend.text = element_text(size=12),
+        strip.background = element_rect(fill = "transparent"),
+        strip.text = element_text(size = 12),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + # theme(legend.position = "top")
+  annotate("text", x = 0, y = 2, label = expression(paste("No publication bias" ~ "(", alpha ~ "=" ~ "0.1", ")")), color = "red", fontface = "bold")
+
+
+# MFEM
+# with publication bias
+mod_stats2 <- mod_stats2 %>% mutate(D2 = beta0_MLMA_flip - beta0_MFEM_flip)
+
+D_vs._slope2_SE3 <- mod_stats2 %>% filter(sig_se2 == "Publication bias") %>% 
+  ggplot(aes(x = beta_pb_flip, y = D2)) +
+  #geom_point(aes(color = es.type), alpha = 0.8) + 
+  geom_point(color = wes_palette("Rushmore1", 4, type = "discrete")[c(1)], alpha = 0.3) + 
+  #facet_grid(. ~ sig_se) +
+  #scale_color_manual(values = wes_palette("BottleRocket2", 4, type = "discrete")) +
+  xlim(0,10) + ylim(-2.5,2.5) + 
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "black") +
+  labs(x = expression(paste("The severity of publication bias")), y = expression(paste(" ", hat(beta),""[(MLMA)]~"-"~hat(beta),""[(FE + VCV)])), size = expression(italic(I)^2)) +
+  #guides(color = "none") +
+  #scale_x_continuous(limits = c(0,3)) +
+  #scale_y_continuous(limits = c(0,3)) +
+  theme_bw() +
+  guides(color = guide_legend(title = "Effect size measures"),
+         shape = guide_legend(title = "Mean effects")) +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=12),
+        legend.text = element_text(size=12),
+        strip.background = element_rect(fill = "transparent"),
+        strip.text = element_text(size = 12),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + # theme(legend.position = "top")
+  annotate("text", x = 5, y = 2, label = expression(paste("Publication bias" ~ "(", alpha ~ "=" ~ "0.1", ")")), color = "red", fontface = "bold")
+
+
+# without publication bias
+D_vs._slope2_SE4 <- mod_stats2 %>% filter(sig_se2 == "No publicaiton bias") %>% 
+  ggplot(aes(x = beta_pb_flip, y = D2)) +
+  #geom_point(aes(color = es.type), alpha = 0.8) + 
+  #geom_point(color = wes_palette("Moonrise3", 4, type = "discrete")[2], alpha = 0.5) + 
+  geom_point(color = wes_palette("Rushmore1", 4, type = "discrete")[c(1)], alpha = 0.3) + 
+  #facet_grid(. ~ sig_se) +
+  #scale_color_manual(values = wes_palette("BottleRocket2", 4, type = "discrete")) + 
+  xlim(-5,5) + ylim(-2.5,2.5) + 
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "black") + 
+  labs(x = expression(paste("The severity of publication bias")), y = expression(paste(" ", hat(beta),""[(MLMA)]~"-"~hat(beta),""[(FE + VCV)])), size = expression(italic(I)^2)) +
+  #guides(color = "none") +
+  #scale_x_continuous(limits = c(0,3)) +
+  #scale_y_continuous(limits = c(0,3)) +
+  theme_bw() +
+  guides(color = guide_legend(title = "Effect size measures"),
+         shape = guide_legend(title = "Mean effects")) +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=10),
+        legend.text = element_text(size=10),
+        strip.background = element_rect(fill = "transparent"),
+        strip.text = element_text(size = 12),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + # theme(legend.position = "top")
+  annotate("text", x = 0, y = 2, label = expression(paste("No publication bias" ~ "(", alpha ~ "=" ~ "0.1", ")")), color = "red", fontface = "bold")
+
+
+
+png(filename = "figS3.png", width = 8, height = 7, units = "in", type = "windows", res = 400)
+cowplot::plot_grid(D_vs._slope2_SE1, D_vs._slope2_SE2, 
+                   D_vs._slope2_SE3, D_vs._slope2_SE4,
+                   labels = c('A', 'B', "C", "D"), label_size = 12, nrow = 2, ncol = 2) %>% suppressWarnings()
+dev.off()
+```
+
+
+# Additional analysis
+
+We added the performance comparison between our method and the classic publication-bias adjustment methods (PETPEESE). We also added selection model as sensitivity analysis for detecting publication bias.
+
+
+
+## Sensitivity analysis - 3 parameters selection model (3PSM) 
+
+```{r}
+#-----------------------not run-------------------------------
+#dat_list <- readRDS(here("data","dat_list.Rds"))
+
+#dat_esc <- NA
+#for (i in 1:length(dat_list)) {
+#  dat_esc[i] <- escalc(yi = eff.size, vi = var.eff.size, data = dat_list[[i]]) %>% list()
+#}
+
+#dat_agg <- NA
+#for (i in 1:length(dat_list)) {
+#  dat_agg[i] <- aggregate.escalc(dat_esc[[i]], cluster = study, rho = 0.5) %>% #list()
+#}
+#saveRDS(dat_agg, file = "dat_agg.Rds")
+#-----------------------not run-------------------------------
+dat_agg <- readRDS(here("data","dat_agg.Rds"))
+
+
+
+# first step - fit random-effects model for each meta-analytic case
+model_agg_all <- NA
+for (i in 1:length(dat_agg)) {
+  model_agg_all[i] <- rma(yi = eff.size, vi = var.eff.size, method = "REML", test = "t", data = dat_agg[[i]], verbose = TRUE, control=list(maxiter=1000, stepadj=0.5)) %>% list()
+} 
+
+# save to save time
+#saveRDS(model_agg_all, file = "model_agg_all_fitted.Rds")
+model_agg_all <- readRDS(file = "model_agg_all_fitted.Rds")
+
+
+# fit step function selection model (3PSM)
+model_agg_all_selmod <- NA
+
+for (i in 1:length(model_agg_all)) {
+  tryCatch({
+    model_agg_all_selmod[i] <- selmodel(model_agg_all[[i]], type = "stepfun", steps = c(.025)) %>% list()
+  }, error = function(e) {
+    cat("Error in Model", i, ":", conditionMessage(e), "\n")
+    model_agg_all_selmod[i] <- NA  # or any other value indicating a problem
+  }, warning = function(w) {
+    cat("Warning in Model", i, ":", conditionMessage(w), "\n")
+    # You can choose to handle warnings differently if needed
+    model_agg_all_selmod[i] <- NA  # or any other value indicating a problem
+  })
+}
+
+# save to save time
+#saveRDS(model_agg_all_selmod, file = "model_agg_all_selmod_fitted.Rds")
+model_agg_all_selmod <- readRDS(file = "model_agg_all_selmod_fitted.Rds")
+
+# fit beta selection model
+model_agg_all_selmod2 <- NA
+for (i in 1:length(model_agg_all)) {
+  tryCatch({
+    model_agg_all_selmod2[i] <- selmodel(model_agg_all[[i]], type = "beta") %>% list()
+  }, error = function(e) {
+    cat("Error in Model", i, ":", conditionMessage(e), "\n")
+    model_agg_all_selmod2[i] <- NA  # or any other value indicating a problem
+  }, warning = function(w) {
+    cat("Warning in Model", i, ":", conditionMessage(w), "\n")
+    # You can choose to handle warnings differently if needed
+    model_agg_all_selmod2[i] <- NA  # or any other value indicating a problem
+  })
+}
+
+# save to save time
+#saveRDS(model_agg_all_selmod2, file = "model_agg_all_selmod_fitted2.Rds")
+model_agg_all_selmod2 <- readRDS(file = "model_agg_all_selmod_fitted2.Rds")
+
+# extract LRTp from each element in the list
+LRTp_values <- sapply(model_agg_all_selmod, function(model) {
+  if (!is.null(model) && !is.na(model$LRTp)) {
+    return(model$LRTp)
+  } else {
+    return(NA)  # or any other value indicating a convergence issue
+  }
+})
+
+
+
+LRTp_values2 <- sapply(model_agg_all_selmod2, function(model) {
+  if (!is.null(model) && !is.na(model$LRTp)) {
+    return(model$LRTp)
+  } else {
+    return(NA)  # or any other value indicating a convergence issue
+  }
+})
+
+mod_stats_selmod <- data.frame(MA_case = names(dat_list), p_selmodel = LRTp_values,  p2_selmodel = LRTp_values2)
+
+mod_stats_sensitivity <- left_join(mod_stats2,mod_stats_selmod,by="MA_case")
+
+# whether publication bias exists
+## alpha = 0.05
+mod_stats_sensitivity <- mod_stats_sensitivity %>% mutate(sig_selmod = base::ifelse(p_selmodel < 0.05, "Publication bias", "No publicaiton bias")) # 3PSM
+mod_stats_sensitivity <- mod_stats_sensitivity %>% mutate(sig2_selmod = base::ifelse(p2_selmodel < 0.05, "Publication bias", "No publicaiton bias")) # beta selection model
+
+
+## alpha = 0.1
+mod_stats_sensitivity <- mod_stats_sensitivity %>% mutate(sig_selmod2 = base::ifelse(p_selmodel < 0.1, "Publication bias", "No publicaiton bias")) # 3PSM
+mod_stats_sensitivity <- mod_stats_sensitivity %>% mutate(sig2_selmod2 = base::ifelse(p2_selmodel < 0.1, "Publication bias", "No publicaiton bias")) # beta  selection model
+
+```
+
+
+## Performance table
+
+```{r}
+#-------------------addition-------------------#
+# performance metrics summary - presence of publication bias
+a <- mod_stats_sensitivity %>% filter(sig_se == "Publication bias" & sig_beta0 == "True effect") # Egger
+b <- mod_stats_sensitivity %>% filter(sig_selmod == "Publication bias" & sig_beta0 == "True effect") # 3PSM
+c <- mod_stats_sensitivity %>% filter(sig2_selmod == "Publication bias" & sig_beta0 == "True effect") # Egger
+
+#********************FE-VCV-CRVE********************#
+# the PET-PEESE overestimation (overestimation factor)
+mean( (a$beta0_MFEM_flip) / mean( a$beta0_PETPEESE_flip) ) # 1.205056
+mean( (b$beta0_MFEM_flip) / mean( b$beta0_PETPEESE_flip) ) # 1.072502
+mean( (c$beta0_MFEM_flip) / mean( c$beta0_PETPEESE_flip) ) # 0.8191231
+
+# compute bias (mean error)
+mean( (a$beta0_MFEM_flip - a$beta0_PETPEESE_flip) ) # 0.04739279
+mean( (b$beta0_MFEM_flip - b$beta0_PETPEESE_flip) ) # 0.01963796
+mean( (c$beta0_MFEM_flip - c$beta0_PETPEESE_flip) ) #  -0.05755192
+
+# compute MSE (mean square error) or RMSE - root
+mean( (a$beta0_MFEM_flip - a$beta0_PETPEESE_flip)^2 ) # 0.2685345
+mean( (b$beta0_MFEM_flip - b$beta0_PETPEESE_flip)^2 ) # 0.3295665
+mean( (c$beta0_MFEM_flip - c$beta0_PETPEESE_flip)^2 ) # 0.1776128
+
+# performance metrics summary - absence of publication bias
+a2 <- mod_stats_sensitivity %>% filter(sig_se == "No publicaiton bias") 
+b2 <- mod_stats_sensitivity %>% filter(sig_selmod == "No publicaiton bias")
+c2 <- mod_stats_sensitivity %>% filter(sig2_selmod == "No publicaiton bias")
+
+# the PET-PEESE overestimation (overestimation factor)
+mean( (a2$beta0_MFEM_flip) / mean(a2$beta0_PETPEESE_flip) ) # 0.9580492
+mean( (b2$beta0_MFEM_flip) / mean(b2$beta0_PETPEESE_flip) ) # 1.013454
+mean( (c2$beta0_MFEM_flip) / mean(c2$beta0_PETPEESE_flip) ) # 1.134558
+
+# compute bias (mean error)
+mean( (a2$beta0_MFEM_flip - a2$beta0_PETPEESE_flip) ) # -0.0161294
+mean( (b2$beta0_MFEM_flip - b2$beta0_PETPEESE_flip) ) # 0.004362078
+mean( (c2$beta0_MFEM_flip - c2$beta0_PETPEESE_flip) ) # 0.04364582
+
+
+# compute RMSE (root mean square error)
+mean( (a2$beta0_MFEM_flip - a2$beta0_PETPEESE_flip)^2 ) # 0.3967629
+mean( (b2$beta0_MFEM_flip - b2$beta0_PETPEESE_flip)^2 ) # 0.3870613
+mean( (c2$beta0_MFEM_flip - c2$beta0_PETPEESE_flip)^2 ) # 0.576313
+
+
+#********************UWLS-CRVE********************#
+# performance metrics summary - presence of publication bias
+# the PET-PEESE overestimation (overestimation factor)
+mean( (a$beta0_WLS_flip) / mean( a$beta0_PETPEESE_flip) ) # 1.981028
+mean( (b$beta0_WLS_flip) / mean( b$beta0_PETPEESE_flip) ) # 1.54154
+mean( (c$beta0_WLS_flip) / mean( c$beta0_PETPEESE_flip) ) # 1.215325
+
+# compute bias (mean error)
+mean( (a$beta0_WLS_flip - a$beta0_PETPEESE_flip) ) #  0.2267367
+mean( (b$beta0_WLS_flip - b$beta0_PETPEESE_flip) ) # 0.1466821
+mean( (c$beta0_WLS_flip - c$beta0_PETPEESE_flip) ) #  0.06851266
+
+# compute MSE (mean square error) or RMSE - root
+mean( (a$beta0_WLS_flip - a$beta0_PETPEESE_flip)^2 ) # 0.2718399
+mean( (b$beta0_WLS_flip - b$beta0_PETPEESE_flip)^2 ) # 0.2675543
+mean( (c$beta0_WLS_flip - c$beta0_PETPEESE_flip)^2 ) #  0.1483234
+
+# performance metrics summary - absence of publication bias
+a2 <- mod_stats_sensitivity %>% filter(sig_se == "No publicaiton bias") 
+b2 <- mod_stats_sensitivity %>% filter(sig_selmod == "No publicaiton bias")
+c2 <- mod_stats_sensitivity %>% filter(sig2_selmod == "No publicaiton bias")
+
+# the PET-PEESE overestimation (overestimation factor)
+mean( (a2$beta0_WLS_flip) / mean(a2$beta0_PETPEESE_flip) ) # 0.9506386
+mean( (b2$beta0_WLS_flip) / mean(b2$beta0_PETPEESE_flip) ) # 1.129152
+mean( (c2$beta0_WLS_flip) / mean(c2$beta0_PETPEESE_flip) ) # 1.183072
+
+# compute bias (mean error)
+mean( (a2$beta0_WLS_flip - a2$beta0_PETPEESE_flip) ) # -0.01897865
+mean( (b2$beta0_WLS_flip - b2$beta0_PETPEESE_flip) ) # 0.04187278
+mean( (c2$beta0_WLS_flip - c2$beta0_PETPEESE_flip) ) # 0.05938233
+
+
+# compute RMSE (root mean square error)
+mean( (a2$beta0_WLS_flip - a2$beta0_PETPEESE_flip)^2 ) # 0.3791787
+mean( (b2$beta0_WLS_flip - b2$beta0_PETPEESE_flip)^2 ) # 0.3846172
+mean( (c2$beta0_WLS_flip - c2$beta0_PETPEESE_flip)^2 ) # 0.5483372
+```
+
+
+## New figs
+
+### fig2 
+
+```{r}
+#-------------------plot-------------------#
+# define study_N threshold
+threshold <- c(10)
+
+# filter data for study_N <= threshold
+data_below_threshold_egger <- mod_stats2 %>%
+  filter(sig_se == "Publication bias" & sig_beta0 == "True effect" & study_N <= threshold[1]) # Egger's test
+data_below_threshold_3psm <- mod_stats_sensitivity %>%
+  filter(sig_selmod2 == "Publication bias" & sig_beta0 == "True effect" & study_N <= threshold[1]) # 3PSM
+
+# filter data for study_N > threshold
+data_above_threshold_egger <- vector("list", length = length(threshold))
+for (i in seq_along(threshold)) {
+  N <- threshold[i]
+  data_above_threshold_egger[[i]] <- filter(mod_stats2, sig_se == "Publication bias" & sig_beta0 == "True effect" & study_N > N)
+} # Egger's test
+
+data_above_threshold_3psm <- vector("list", length = length(threshold))
+for (i in seq_along(threshold)) {
+  N <- threshold[i]
+  data_above_threshold_3psm[[i]] <- filter(mod_stats_sensitivity, sig_selmod2 == "Publication bias" & sig_beta0 == "True effect" & study_N > N)
+} # 3PSM
+
+
+#-------------------------mean errors-------------------------#
+# FE + VCV
+calc_mean_error_FEVCV <- function(data) {
+  return(mean(data$beta0_MFEM_flip - data$beta0_PETPEESE_flip))
+} # function calculating mean error
+
+mean_error_below_threshold <- mean(data_below_threshold_egger$beta0_MFEM_flip - data_below_threshold_egger$beta0_PETPEESE_flip)
+
+mean_error_above_threshold <- lapply(data_above_threshold_egger, calc_mean_error_FEVCV) %>% unlist() # Egger's test
+
+mean_error_below_threshold2 <- mean(data_below_threshold_3psm$beta0_MFEM_flip - data_below_threshold_3psm$beta0_PETPEESE_flip)
+mean_error_above_threshold2 <- lapply(data_above_threshold_3psm, calc_mean_error_FEVCV) %>% unlist() # 3PSM
+
+# UWLS
+# function calculating mean error
+calc_mean_error_UWLS <- function(data) {
+  return(mean(data$beta0_WLS_flip - data$beta0_PETPEESE_flip))
+} 
+mean_error_below_threshold3 <- mean(data_below_threshold_egger$beta0_WLS_flip - data_below_threshold_egger$beta0_PETPEESE_flip)
+mean_error_above_threshold3 <- lapply(data_above_threshold_egger, calc_mean_error_UWLS) %>% unlist() # Egger's test
+
+mean_error_below_threshold4 <- mean(data_below_threshold_3psm$beta0_WLS_flip - data_below_threshold_3psm$beta0_PETPEESE_flip)
+mean_error_above_threshold4 <- lapply(data_above_threshold_3psm, calc_mean_error_UWLS) %>% unlist() # 3PSM
+
+mean_error_data <- data.frame(threshold = rep(c("N < 10", "N > 10"),4),
+                              value = c(mean_error_below_threshold,mean_error_above_threshold,mean_error_below_threshold2,mean_error_above_threshold2,mean_error_below_threshold3,mean_error_above_threshold3,mean_error_below_threshold4,mean_error_above_threshold4),
+                              estimator = c(rep("FE + VCV", 4), rep("UWLS", 4)),
+                              pb_method = c(rep("MLMA Egger",2), rep("Ad hoc 3PSM",2),rep("MLMA Egger",2), rep("Ad hoc 3PSM",2)))
+
+# desired order
+mean_error_data$estimator <- as.factor(mean_error_data$estimator)
+mean_error_data$estimator <- factor(mean_error_data$estimator, levels = c("FE + VCV","UWLS"))
+
+mean_error_data$pb_method <- as.factor(mean_error_data$pb_method)
+mean_error_data$pb_method <- factor(mean_error_data$pb_method, levels = c("MLMA Egger","Ad hoc 3PSM"))
+
+# plot
+# FE + VCV
+mean_error_p <- ggplot(filter(mean_error_data, estimator == "FE + VCV"), aes(x = threshold, y = value, color = pb_method, fill = pb_method)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7, alpha = 0.6) + 
+  #geom_linerange(aes(x = threshold, ymin = 0, ymax = value), position = position_jitter(width = 0.4), size = 5, lineend = "round") + # 
+  #geom_point(position = position_dodge(width = 0.7), size = 4, show.legend = F) +
+  #geom_line(aes(group = pb_method), position = position_dodge(width = 0.7), size = 1.5, show.legend = FALSE) +
+  labs(x = "The numer of studies (N)", y = "Mean error") +
+  scale_y_continuous(limits = c(0,0.71), expand = c(0, 0)) + 
+  #scale_x_discrete(expand = c(0,0)) +
+  geom_text(aes(label = round(value, 3)), size = 3.5, color = "gray10", position = position_dodge(width = 0.7), vjust = -1.2) + 
+  theme_bw() +
+  guides(fill = guide_legend(title = "Detection"), color = "none") +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = 1.5, y = 0.6, label = "Estimator: FE + VCV + CRVE", color = "red", fontface = "bold") 
+
+
+# UWLS
+mean_error_p2 <- ggplot(filter(mean_error_data, estimator == "UWLS"), aes(x = threshold, y = value, color = pb_method, fill = pb_method)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7, alpha = 0.6) + 
+  #geom_point(position = position_dodge(width = 0.7), size = 4, show.legend = F) +
+  #geom_line(aes(group = pb_method), position = position_dodge(width = 0.7), size = 1.5, show.legend = FALSE) +
+  labs(x = "The numer of studies (N)", y = "Mean error") +
+  scale_y_continuous(limits = c(0,0.71), expand = c(0, 0)) + 
+  #scale_x_discrete(expand = c(0,0)) +
+  geom_text(aes(label = round(value, 3)), size = 3.5, color = "gray10", position = position_dodge(width = 0.7), vjust = -1.2) + 
+  theme_bw() +
+  guides(fill = guide_legend(title = "Detection"), color = "none") +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = 1.5, y = 0.6, label = "Estimator: UWLS", color = "red", fontface = "bold")
+
+
+#-------------------------mean squared error-------------------------#
+# FE + VCV
+calc_mse_FEVCV <- function(data) {
+  return(mean( (data$beta0_MFEM_flip - data$beta0_PETPEESE_flip)^2 ))
+} # function calculating mean squared error
+
+
+mse_below_threshold <- mean( (data_below_threshold_egger$beta0_MFEM_flip - data_below_threshold_egger$beta0_PETPEESE_flip)^2 )
+mse_above_threshold <- lapply(data_above_threshold_egger, calc_mse_FEVCV) %>% unlist() # Egger's test
+
+mse_below_threshold2 <- mean( (data_below_threshold_3psm$beta0_MFEM_flip - data_below_threshold_3psm$beta0_PETPEESE_flip)^2 )
+mse_above_threshold2 <- lapply(data_above_threshold_3psm, calc_mse_FEVCV) %>% unlist() # 3PSM
+
+# UWLS
+# function calculating mean squared error
+calc_mse_UWLS <- function(data) {
+  return(mean( (data$beta0_WLS_flip - data$beta0_PETPEESE_flip)^2 ))
+} # function calculating mean squared error
+
+mse_below_threshold3 <- mean( (data_below_threshold_egger$beta0_WLS_flip - data_below_threshold_egger$beta0_PETPEESE_flip)^2 )
+mse_above_threshold3 <- lapply(data_above_threshold_egger, calc_mse_UWLS) %>% unlist() # Egger's test
+
+mse_below_threshold4 <- mean( (data_below_threshold_3psm$beta0_WLS_flip - data_below_threshold_3psm$beta0_PETPEESE_flip)^2 )
+mse_above_threshold4 <- lapply(data_above_threshold_3psm, calc_mse_UWLS) %>% unlist() # 3PSM
+
+
+mse_data <- data.frame(threshold = rep(c("N < 10", "N > 10"),4),
+                              value = c(mse_below_threshold,mse_above_threshold,mse_below_threshold2,mse_above_threshold2,mse_below_threshold3,mse_above_threshold3,mse_below_threshold4,mse_above_threshold4),
+                              estimator = c(rep("FE + VCV", 4), rep("UWLS", 4)),
+                              pb_method = c(rep("MLMA Egger",2), rep("Ad hoc 3PSM",2),rep("MLMA Egger",2), rep("Ad hoc 3PSM",2)))
+
+# desired order
+mse_data$estimator <- as.factor(mse_data$estimator)
+mse_data$estimator <- factor(mse_data$estimator, levels = c("FE + VCV","UWLS"))
+
+mse_data$pb_method <- as.factor(mse_data$pb_method)
+mse_data$pb_method <- factor(mse_data$pb_method, levels = c("MLMA Egger","Ad hoc 3PSM"))
+
+# plot
+mse_p <- ggplot(filter(mse_data, estimator == "FE + VCV"), aes(x = threshold, y = value, color = pb_method, fill = pb_method)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7, alpha = 0.6) + 
+  #geom_point(position = position_dodge(width = 0.7), size = 4, show.legend = F) +
+  #geom_line(aes(group = pb_method), position = position_dodge(width = 0.7), size = 1.5, show.legend = FALSE) +
+  labs(x = "The numer of studies (N)", y = "Mean squared error") +
+  scale_y_continuous(limits = c(0,0.71), expand = c(0, 0)) + 
+  #scale_x_discrete(expand = c(0,0)) +
+  geom_text(aes(label = round(value, 3)), size = 3.5, color = "gray10", position = position_dodge(width = 0.7), vjust = -1.2) + 
+  theme_bw() +
+  guides(fill = guide_legend(title = "Detection method"), color = "none") +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = 1.5, y = 0.6, label = "Estimator: FE + VCV + CRVE", color = "red", fontface = "bold")
+
+
+mse_p2 <- ggplot(filter(mse_data, estimator == "UWLS"), aes(x = threshold, y = value, color = pb_method, fill = pb_method)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7, alpha = 0.6) + 
+  #geom_point(position = position_dodge(width = 0.7), size = 4, show.legend = F) +
+  #geom_line(aes(group = pb_method), position = position_dodge(width = 0.7), size = 1.5, show.legend = FALSE) +
+  labs(x = "The numer of studies (N)", y = "Mean squared error") +
+  scale_y_continuous(limits = c(0,0.71), expand = c(0, 0)) + 
+  #scale_x_discrete(expand = c(0,0)) +
+  geom_text(aes(label = round(value, 3)), size = 3.5, color = "gray10", position = position_dodge(width = 0.7), vjust = -1.2) + 
+  theme_bw() +
+  guides(fill = guide_legend(title = "Detection method"), color = "none") +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = 1.5, y = 0.6, label = "Estimator: UWLS", color = "red", fontface = "bold")
+
+
+
+#-------------------------overestimation factor-------------------------#
+# FE + VCV
+calc_of_FEVCV <- function(data) {
+  return(mean((data$beta0_MFEM_flip) / mean(data$beta0_PETPEESE_flip)))
+} # function calculating overestimation factor
+
+of_below_threshold <- mean((data_below_threshold_egger$beta0_MFEM_flip) / mean(data_below_threshold_egger$beta0_PETPEESE_flip))
+of_above_threshold <- lapply(data_above_threshold_egger, calc_of_FEVCV) %>% unlist() # Egger's test
+
+of_below_threshold2 <- mean((data_below_threshold_3psm$beta0_MFEM_flip) / mean(data_below_threshold_3psm$beta0_PETPEESE_flip))
+of_above_threshold2 <- lapply(data_above_threshold_3psm, calc_of_FEVCV) %>% unlist() # 3PSM
+
+# UWLS
+# function calculating overestimation
+calc_of_UWLS <- function(data) {
+  return(mean((data$beta0_WLS_flip) / mean(data$beta0_PETPEESE_flip)))
+} # function calculating overestimation factor
+
+of_below_threshold3 <- mean((data_below_threshold_egger$beta0_WLS_flip) / mean(data_below_threshold_egger$beta0_PETPEESE_flip))
+of_above_threshold3 <- lapply(data_above_threshold_egger, calc_of_UWLS) %>% unlist() # Egger's test
+
+of_below_threshold4 <- mean((data_below_threshold_3psm$beta0_WLS_flip) / mean(data_below_threshold_3psm$beta0_PETPEESE_flip))
+of_above_threshold4 <- lapply(data_above_threshold_3psm, calc_of_UWLS) %>% unlist() # 3PSM
+
+
+of_data <- data.frame(threshold = rep(c("N < 10", "N > 10"),4),
+                              value = c(of_below_threshold,of_above_threshold,of_below_threshold2,of_above_threshold2,of_below_threshold3,of_above_threshold3,of_below_threshold4,of_above_threshold4),
+                              estimator = c(rep("FE + VCV", 4), rep("UWLS", 4)),
+                              pb_method = c(rep("MLMA Egger",2), rep("Ad hoc 3PSM",2),rep("MLMA Egger",2), rep("Ad hoc 3PSM",2)))
+
+# desired order
+of_data$estimator <- as.factor(of_data$estimator)
+of_data$estimator <- factor(of_data$estimator, levels = c("FE + VCV","UWLS"))
+
+of_data$pb_method <- as.factor(of_data$pb_method)
+of_data$pb_method <- factor(of_data$pb_method, levels = c("MLMA Egger","Ad hoc 3PSM"))
+
+# plot
+of_p <- ggplot(filter(of_data, estimator == "FE + VCV"), aes(x = threshold, y = value, color = pb_method, fill = pb_method)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7, alpha = 0.6) + 
+  #geom_point(position = position_dodge(width = 0.7), size = 4, show.legend = F) +
+  #geom_line(aes(group = pb_method), position = position_dodge(width = 0.7), size = 1.5, show.legend = FALSE) +
+  labs(x = "The numer of studies (N)", y = "Overestimation factor") +
+  scale_y_continuous(limits = c(0,3.6), expand = c(0, 0)) + 
+  #scale_x_discrete(expand = c(0,0)) +
+  geom_text(aes(label = round(value, 1)), size = 3.5, color = "gray10", position = position_dodge(width = 0.7), vjust = -1.2) + 
+  theme_bw() +
+  guides(fill = guide_legend(title = "Detection"), color = "none") +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = 1.5, y = 3, label = "Estimator: FE + VCV + CRVE", color = "red", fontface = "bold")
+
+
+of_p2 <- ggplot(filter(of_data, estimator == "UWLS"), aes(x = threshold, y = value, color = pb_method, fill = pb_method)) +
+  geom_bar(stat = "identity", position = "dodge", width = 0.7, alpha = 0.6) + 
+  #geom_point(position = position_dodge(width = 0.7), size = 4, show.legend = F) +
+  #geom_line(aes(group = pb_method), position = position_dodge(width = 0.7), size = 1.5, show.legend = FALSE) +
+  labs(x = "The numer of studies (N)", y = "Overestimation factor") +
+  scale_y_continuous(limits = c(0,3.6), expand = c(0, 0)) + 
+  #scale_x_discrete(expand = c(0,0)) +
+  geom_text(aes(label = round(value, 1)), size = 3.5, color = "gray10", position = position_dodge(width = 0.7), vjust = -1.2) + 
+  theme_bw() +
+  guides(fill = guide_legend(title = "Detection"), color = "none") +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = 1.5, y = 3, label = "Estimator: UWLS", color = "red", fontface = "bold")
+
+
+png(filename = "fig2.png", width = 8, height = 10, units = "in", type = "windows", res = 400)
+cowplot::plot_grid(mean_error_p, mean_error_p2, mse_p, mse_p2, of_p, of_p2,
+                   labels = c('A', 'B', 'C', 'D', "E", "F"), label_size = 12, nrow = 3, ncol = 2) %>% suppressWarnings()
+dev.off()
+
+```
+
+
+
+
+
+### fig3
+```{r}
+# convert beta0
+mod_stats2_beta0 <- mod_stats2 %>%
+  select(MA_case, beta0_MLMA_flip, beta0_PETPEESE_flip, beta0_MFEM_flip, sig_se, sig_beta0, study_N) %>%
+  pivot_longer(cols = c(beta0_PETPEESE_flip, beta0_MFEM_flip),
+               names_to = "estimator_alternative", values_to = "beta0_alternative") 
+# %>% mutate(estimator_alternative = gsub("[0-9]+", "", estimator_alternative))
+
+names(mod_stats2_beta0)[names(mod_stats2_beta0) == "beta0_MLMA_flip"] <- c("beta0")
+
+mod_stats2_beta0$estimator_alternative <- as.factor(mod_stats2_beta0$estimator_alternative)
+
+mod_stats2_beta0$estimator_alternative <- factor(mod_stats2_beta0$estimator_alternative, levels = c("beta0_PETPEESE_flip", "beta0_MFEM_flip"))
+
+
+# with marginal distribution
+## recode
+mod_stats2_beta0 <- mod_stats2_beta0 %>% mutate(estimator_alternative=dplyr::recode(estimator_alternative, 'beta0_PETPEESE_flip'='PET-PEESE', 'beta0_MFEM_flip'='FE + VCV'))
+
+
+# with publication bias 
+beta0_all_pb1 <- mod_stats2_beta0 %>% filter(sig_se == "Publication bias" & sig_beta0 == "True effect" & study_N > 20) %>% 
+  ggplot(aes(x = beta0, y = beta0_alternative)) +
+  #geom_point(aes(size = M1s), alpha = 0.5, color = "#0072B2", fill = "#0072B2") 
+  geom_point(aes(color = estimator_alternative, fill = estimator_alternative), alpha = 0.8) +
+  #facet_grid(. ~ sig_se) +
+  #facet_grid(. ~ sig_beta0) +
+  #viridis::scale_color_viridis(discrete = T) + 
+  scale_color_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) + #  BottleRocket2
+  scale_fill_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) +
+  #scale_fill_manual(values = wes_palette("GrandBudapest2", 4, type = "discrete")) +
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "red") +
+  #stat_regline_equation(label.y = 3.5, aes(label = ..eq.label..)) +
+  #scale_color_hue(labels = c("UWLS", "MFEM", "LMEM")) + # editing legend (text) labels - https://stackoverflow.com/questions/23635662/editing-legend-text-labels-in-ggplot
+  geom_abline(intercept = 0, slope = 1, colour= 'black', linetype = "dashed") + 
+  labs(x = expression(paste(hat(beta),""[(MLMA)] ~ "(Benchmark)")), y = expression(paste(hat(beta),""[] ~ "(Bias-robust)")), size = expression(italic(I)^2)) +
+  guides(color = guide_legend(title = "Estimator"), fill = "none") +
+  scale_x_continuous(limits = c(-1,3)) +
+  scale_y_continuous(limits = c(-1,3)) +
+  theme_bw() +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = 0.5, y = 2.5, label = "Selective reporting", color = "red", fontface = "bold") 
+
+# marginal # https://github.com/daattali/ggExtra
+#beta0_all_pb1.2 <- ggExtra::ggMarginal(beta0_all_pb1, groupColour = TRUE, groupFill = TRUE)
+
+# keep original legend
+options("aplot_guides" = "keep") # https://github.com/YuLab-SMU/aplot/issues/6
+
+
+top.dist_beta0_all_pb1 <- mod_stats2_beta0 %>% filter(sig_se == "Publication bias" & sig_beta0 == "True effect" & study_N > 20) %>%
+  ggplot(aes(x = beta0)) + 
+  geom_density(color = wes_palette("Rushmore1", 4, type = "discrete")[4], fill=wes_palette("Rushmore1", 4, type = "discrete")[4], alpha = 0.8) + 
+  scale_x_continuous(limits = c(-1,3), expand = expansion(mult = c(0, 0.01))) +
+  labs(x = "", y = "") + 
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+right.dist_beta0_all_pb1 <- mod_stats2_beta0 %>% filter(sig_se == "Publication bias" & sig_beta0 == "True effect" & study_N > 20) %>%
+  ggplot(aes(x = beta0_alternative, color = estimator_alternative, fill = estimator_alternative)) + 
+  geom_density(alpha = 0.8) +
+  scale_color_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) + 
+  scale_fill_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) +
+  scale_x_continuous(limits = c(-1,3), expand = expansion(mult = c(0, 0.01))) +
+  guides(fill = "none", color = "none") +
+  labs(x = "", y = "") + 
+  coord_flip() +
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+beta0_all_pb1.2 <- suppressMessages(beta0_all_pb1 %>% 
+  insert_top(top.dist_beta0_all_pb1, height=.3) %>% 
+  insert_right(right.dist_beta0_all_pb1, width=.3)) # print(beta0_all_pb1.2) & theme(legend.position="bottom")
+
+
+# without publication bias
+beta0_all_pb0 <- mod_stats2_beta0 %>% filter(sig_se == "No publicaiton bias" & sig_beta0 == "True effect" & study_N > 20) %>% 
+  ggplot(aes(x = beta0, y = beta0_alternative)) +
+  #geom_point(aes(size = M1s), alpha = 0.5, color = "#0072B2", fill = "#0072B2") 
+  geom_point(aes(color = estimator_alternative, fill = estimator_alternative), alpha = 0.8) +
+  #facet_grid(. ~ sig_se) +
+  #facet_grid(. ~ sig_beta0) +
+  theme_bw() +
+  #viridis::scale_color_viridis(discrete = T) + 
+  scale_color_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) +
+  scale_fill_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) +
+  #geom_smooth(method =  "lm", formula = y~x, se = FALSE, color = "red") +
+  #stat_regline_equation(label.y = 3.5, aes(label = ..eq.label..)) +
+  #scale_color_hue(labels = c("UWLS", "MFEM", "LMEM")) + # editing legend (text) labels - https://stackoverflow.com/questions/23635662/editing-legend-text-labels-in-ggplot
+  geom_abline(intercept = 0, slope = 1, colour= 'black', linetype = "dashed") + 
+  labs(x = expression(paste(hat(beta),""[(MLMA)] ~ "(Benchmark)")), y = expression(paste(hat(beta),""[] ~ "(Bias-robust)")), size = expression(italic(I)^2), parse = TRUE) +
+  guides(color = guide_legend(title = "Estimator"), fill = "none") +
+  scale_x_continuous(limits = c(-1,3)) +
+  scale_y_continuous(limits = c(-1,3)) +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = 0.5, y = 2.5, label = "No selective reporting", color = "red", fontface = "bold") 
+
+#beta0_all_pb0.2 <- ggExtra::ggMarginal(beta0_all_pb0, groupColour = TRUE, groupFill = TRUE)
+
+# keep original legend
+options("aplot_guides" = "keep") # https://github.com/YuLab-SMU/aplot/issues/6
+
+top.dist_beta0_all_pb0 <- mod_stats2_beta0 %>% filter(sig_se == "No publicaiton bias" & sig_beta0 == "True effect" & study_N > 20) %>%
+  ggplot(aes(x = beta0)) + 
+  geom_density(color = wes_palette("Rushmore1", 4, type = "discrete")[4], fill=wes_palette("Rushmore1", 4, type = "discrete")[4], alpha = 0.8) + 
+  scale_x_continuous(limits = c(-1,3), expand = expansion(mult = c(0, 0.01))) +
+  labs(x = "", y = "") + 
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+right.dist_beta0_all_pb0 <- mod_stats2_beta0 %>% filter(sig_se == "No publicaiton bias" & study_N > 20) %>%
+  ggplot(aes(x = beta0_alternative, color = estimator_alternative, fill = estimator_alternative)) + 
+  geom_density(alpha = 0.8) +
+  scale_color_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) + 
+  scale_fill_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) +
+  scale_x_continuous(limits = c(-1,3), expand = expansion(mult = c(0, 0.01))) +
+  guides(fill = "none", color = "none") +
+  labs(x = "", y = "") + 
+  coord_flip() +
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+beta0_all_pb0.2 <- suppressMessages(beta0_all_pb0 %>% 
+  insert_top(top.dist_beta0_all_pb0, height=.3) %>% 
+  insert_right(right.dist_beta0_all_pb0, width=.3)) 
+
+#as.ggplot(beta0_all_pb1.2) + as.ggplot(beta0_all_pb0.2) + plot_layout(ncol = 2, nrow = 1)
+
+
+
+#------------------------------------------------------------------#
+# convert se_beta0
+mod_stats2_se <- mod_stats2 %>%
+  select(MA_case, se_MLMA, se_MFEM, se_MFEM_RVE, sig_se, sig_beta0, study_N) %>%
+  pivot_longer(cols = c(se_MFEM, se_MFEM_RVE),
+               names_to = "estimator_alternative", values_to = "se_alternative") 
+names(mod_stats2_se)[names(mod_stats2_se) == "se_MLMA"] <- c("se")
+
+mod_stats2_se$estimator_alternative <- as.factor(mod_stats2_se$estimator_alternative)
+
+mod_stats2_se$estimator_alternative <- factor(mod_stats2_se$estimator_alternative, levels = c("se_MFEM", "se_MFEM_RVE"))
+
+# recode
+mod_stats2_se <- mod_stats2_se %>% mutate(estimator_alternative=dplyr::recode(estimator_alternative, 'se_MFEM'='FE + VCV' , "se_MFEM_RVE" = "FE + VCV + CRVE"))
+
+# add whether using RVE
+mod_stats2_se$RVE <- rep(c("Before", "After"), 448) # nrow(mod_stats2) = 448 or nrow(mod_stats2_se)/4
+
+  
+# se_beta0 (log scale)
+# before CRVE
+se_all_pb1 <- mod_stats2_se %>% filter(RVE == "Before" & sig_beta0 == "True effect" & sig_se == "Publication bias" & study_N > 20) %>%  
+  ggplot(aes(x = log(se), y = log(se_alternative))) +
+  geom_point(aes(color = estimator_alternative), alpha = 0.8) +
+  scale_color_manual(values = wes_palette("Moonrise3", 4, type = "discrete")[2]) +
+  scale_fill_manual(values = wes_palette("Moonrise3", 4, type = "discrete")[2]) +
+  geom_abline(intercept = 0, slope = 1, colour= 'black', linetype = "dashed") + 
+  labs(x = expression(paste("SE","(",hat(beta),""[(MLMA)],")" ~ "(Benchmark) (log)")), y = expression(paste("SE","(",hat(beta),""[],")" ~ "(Naive variance) (log)")), size = expression(italic(I)^2)) + 
+  guides(color = guide_legend(title = "Estimator"), fill = "none") +
+  scale_x_continuous(limits = c(-5,0)) +
+  scale_y_continuous(limits = c(-5,0)) +
+  theme_bw() +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = -3.0, y = -0.7, label = "Before CRVE", color = "red", fontface = "bold")
+#se_all_pb1.2 <- ggExtra::ggMarginal(se_all_pb1, groupColour = TRUE, groupFill = TRUE)
+
+
+# keep original legend
+options("aplot_guides" = "keep")
+
+top.dist_se_all_pb1 <- mod_stats2_se %>% filter(RVE == "Before" & sig_beta0 == "True effect" & sig_se == "Publication bias" & study_N > 20) %>%
+  ggplot(aes(x = log(se))) + 
+  geom_density(color = wes_palette("Moonrise3", 4, type = "discrete")[1], fill = wes_palette("Moonrise3", 4, type = "discrete")[1], alpha = 0.8) + 
+  scale_x_continuous(limits =  c(-5,0), expand = expansion(mult = c(0, 0.01))) +
+  labs(x = "", y = "") + 
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+right.dist_se_all_pb1 <- mod_stats2_se %>% filter(RVE == "Before" & sig_beta0 == "True effect" & sig_se == "Publication bias" & study_N > 20) %>%
+  ggplot(aes(x = log(se_alternative))) + 
+  geom_density(color = wes_palette("Moonrise3", 4, type = "discrete")[2], fill = wes_palette("Moonrise3", 4, type = "discrete")[2], alpha = 0.8) + 
+  scale_x_continuous(limits =  c(-5,0), expand = expansion(mult = c(0, 0.01))) +
+  coord_flip() +
+  labs(x = "", y = "") + 
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+se_all_pb1.2 <- suppressMessages(se_all_pb1 %>% 
+  insert_top(top.dist_se_all_pb1, height=.3) %>% 
+  insert_right(right.dist_se_all_pb1, width=.3)) 
+
+
+# after CRVE
+se_all_pb0 <- mod_stats2_se %>% filter(RVE == "After" & sig_beta0 == "True effect" & sig_se == "No publicaiton bias" & study_N > 20) %>% 
+  ggplot(aes(x = log(se), y = log(se_alternative))) +
+  geom_point(aes(color = estimator_alternative, fill = estimator_alternative), alpha = 0.8) +
+  scale_color_manual(values = wes_palette("Moonrise3", 4, type = "discrete")[2]) +
+  scale_fill_manual(values = wes_palette("Moonrise3", 4, type = "discrete")[2]) +
+  geom_abline(intercept = 0, slope = 1, colour= 'black', linetype = "dashed") + 
+  labs(x = expression(paste("SE","(",hat(beta),""[(MLMA)],")" ~ "(Benchmark) (log)")), y = expression(paste("SE","(",hat(beta),""[],")" ~ "(Variance-robust) (log)")), size = expression(italic(I)^2)) + 
+  guides(color = guide_legend(title = "Estimator"), fill = "none") +
+  scale_x_continuous(limits = c(-5,0)) +
+  scale_y_continuous(limits = c(-5,0)) +
+  theme_bw() +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = -3.0, y = -0.7, label = "After CRVE", color = "red", fontface = "bold")
+#se_all_pb0.2 <- ggExtra::ggMarginal(se_all_pb0, groupColour = TRUE, groupFill = TRUE)
+
+top.dist_se_all_pb0 <- mod_stats2_se %>% filter(RVE == "After" & sig_beta0 == "True effect" & sig_se == "Publication bias") %>%
+  ggplot(aes(x = log(se))) + 
+  geom_density(color = wes_palette("Moonrise3", 4, type = "discrete")[1], fill = wes_palette("Moonrise3", 4, type = "discrete")[1], alpha = 0.8) + 
+  scale_x_continuous(limits =  c(-5,0), expand = expansion(mult = c(0, 0.01))) +
+  labs(x = "", y = "") + 
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+right.dist_se_all_pb0 <- mod_stats2_se %>% filter(RVE == "After" & sig_beta0 == "True effect" & sig_se == "Publication bias" & study_N > 20) %>%
+  ggplot(aes(x = log(se_alternative))) + 
+  geom_density(color = wes_palette("Moonrise3", 4, type = "discrete")[2], fill = wes_palette("Moonrise3", 4, type = "discrete")[2], alpha = 0.8) + 
+  scale_x_continuous(limits =  c(-5,0), expand = expansion(mult = c(0, 0.01))) +
+  coord_flip() +
+  labs(x = "", y = "") + 
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+se_all_pb0.2 <- suppressMessages(se_all_pb0 %>% 
+  insert_top(top.dist_se_all_pb0, height=.3) %>% 
+  insert_right(right.dist_se_all_pb0, width=.3)) 
+
+
+png(filename = "fig3.png", width = 8, height = 8, units = "in", type = "windows", res = 400)
+cowplot::plot_grid(as.ggplot(beta0_all_pb1.2), as.ggplot(beta0_all_pb0.2),
+                   as.ggplot(se_all_pb1.2), as.ggplot(se_all_pb0.2),
+                   labels = c('A', 'B', 'C', 'D'), label_size = 12, nrow = 2, ncol = 2) %>% suppressWarnings()
+dev.off()
+
+
+```
+
+### fig4
+
+```{r}
+# fig4
+# beta0 - MLMA vs. PETPEESE - publication bias
+df_2x2_spread <- data_2x2(
+  array_1 = filter(mod_stats2, sig_se == "Publication bias")$beta0_MLMA_flip,
+  array_2 = filter(mod_stats2, sig_se == "Publication bias")$beta0_PETPEESE_flip,
+  array_3 = filter(mod_stats2, sig_se == "Publication bias")$beta0_MLMA_flip,
+  array_4 = filter(mod_stats2, sig_se == "Publication bias")$beta0_PETPEESE_flip,
+  labels = (c('congruent','incongruent')),
+  jit_distance = .09,
+  jit_seed = 321,
+  spread_x_ticks = TRUE) 
+
+paired_beta0_pb1 <- raincloud_2x2_repmes(
+  data = df_2x2_spread, 
+  colors = c("#35274A", "#E1BD6D", "#35274A", "#0B775E"),
+  fills = c("#35274A", "#E1BD6D", "#35274A", "#0B775E"), # https://www.datanovia.com/en/blog/top-r-color-palettes-to-know-for-great-data-visualization/
+  line_color = 'gray',
+  line_alpha = .3,
+  size = 1,
+  alpha = .8,
+  spread_x_ticks = TRUE) +
+
+scale_x_continuous(breaks=c(1,2,3,4), labels=c("MLMA", "PET-PEESE", "MLMA", "FE + VCV"), limits=c(0, 5)) +
+  xlab("Estimator") + 
+  ylab(expression(paste(hat(beta)))) +
+  ylim(-1,3) +
+  annotate(geom = "text", x= 1, y = -1, label = "Selective reporting") +
+  annotate(geom = "text", x= 4, y = -1, label = "Selective reporting") +
+  theme_classic() + 
+  theme(axis.text = element_text(size = 12), axis.title = element_text(size = 14))
+
+
+# beta0 - MLMA vs. PETPEESE - no publication bias
+df_2x2_spread <- data_2x2(
+  array_1 = filter(mod_stats2, sig_se == "No publicaiton bias")$beta0_MLMA_flip,
+  array_2 = filter(mod_stats2, sig_se == "No publicaiton bias")$beta0_PETPEESE_flip,
+  array_3 = filter(mod_stats2, sig_se == "No publicaiton bias")$beta0_MLMA_flip,
+  array_4 = filter(mod_stats2, sig_se == "No publicaiton bias")$beta0_PETPEESE_flip,
+  labels = (c('congruent','incongruent')),
+  jit_distance = .09,
+  jit_seed = 321,
+  spread_x_ticks = TRUE) 
+
+paired_beta0_pb0 <- raincloud_2x2_repmes(
+  data = df_2x2_spread, 
+  colors = c("#35274A", "#E1BD6D", "#35274A", "#0B775E"),
+  fills = c("#35274A", "#E1BD6D", "#35274A", "#0B775E"), # https://www.datanovia.com/en/blog/top-r-color-palettes-to-know-for-great-data-visualization/
+  line_color = 'gray',
+  line_alpha = .3,
+  size = 1,
+  alpha = .8,
+  spread_x_ticks = TRUE) +
+
+scale_x_continuous(breaks=c(1,2,3,4), labels=c("MLMA", "PET-PEESE", "MLMA", "FE + VCV"), limits=c(0, 5)) +
+  xlab("Estimator") + 
+  ylab(expression(paste(hat(beta)))) +
+  ylim(-1,3) +
+  annotate(geom = "text", x= 1, y = -1, label = "No selective reportings") +
+  annotate(geom = "text", x= 4, y = -1, label = "No selective reporting") +
+  theme_classic() + 
+  theme(axis.text = element_text(size = 12), axis.title = element_text(size = 14))
+
+png(filename = "fig4.png", width = 10, height = 4, units = "in", type = "windows", res = 400)
+cowplot::plot_grid(paired_beta0_pb1, paired_beta0_pb0, labels = c('A', 'B'), label_size = 12,nrow = 1, ncol = 2) %>% suppressWarnings()
+dev.off()
+```
+
+
+### fig5
+```{r}
+# fig5
+png(filename = "fig5.png", width = 8, height = 4, units = "in", type = "windows", res = 400)
+cowplot::plot_grid(D_vs._slope_SE3, D_vs._slope_SE4,
+                   labels = c('A', 'B'), label_size = 12, nrow = 1, ncol = 2) %>% suppressWarnings()
+dev.off()
+
+```
+
+
+### fig6
+
+```{r}
+# fig5
+png(filename = "fig6.png", width = 8, height = 4, units = "in", type = "windows", res = 400)
+cowplot::plot_grid(D_se_vs._ICC3, D_se_vs._ICC4,
+                   labels = c('A', 'B'), 
+                   label_size = 12,nrow = 1, ncol = 2) %>% suppressWarnings()
+dev.off()
+```
+
+
+### Additional supplementary Figs 
+#### figS4
+
+This supplementary figure is corresponding to fig3
+```{r}
+# convert beta0
+mod_stats2_beta0 <- mod_stats_sensitivity %>%
+  select(MA_case, study_N, beta0_MLMA_flip, beta0_PETPEESE_flip, beta0_MFEM_flip, sig_se, sig_beta0, sig_selmod, sig_selmod2, sig2_selmod, sig2_selmod2, study_N) %>%
+  pivot_longer(cols = c(beta0_PETPEESE_flip, beta0_MFEM_flip),
+               names_to = "estimator_alternative", values_to = "beta0_alternative") 
+# %>% mutate(estimator_alternative = gsub("[0-9]+", "", estimator_alternative))
+
+names(mod_stats2_beta0)[names(mod_stats2_beta0) == "beta0_MLMA_flip"] <- c("beta0")
+
+mod_stats2_beta0$estimator_alternative <- as.factor(mod_stats2_beta0$estimator_alternative)
+
+mod_stats2_beta0$estimator_alternative <- factor(mod_stats2_beta0$estimator_alternative, levels = c("beta0_PETPEESE_flip", "beta0_MFEM_flip"))
+
+
+# with marginal distribution
+## recode
+mod_stats2_beta0 <- mod_stats2_beta0 %>% mutate(estimator_alternative=dplyr::recode(estimator_alternative, 'beta0_PETPEESE_flip'='PETPEESE', 'beta0_MFEM_flip'='FE + VCV'))
+
+
+# with publication bias 
+beta0_all_pb1 <- mod_stats2_beta0 %>% filter(sig_selmod2 == "Publication bias" & sig_beta0 == "True effect" & study_N >= 20) %>% 
+  ggplot(aes(x = beta0, y = beta0_alternative)) +
+  #geom_point(aes(size = M1s), alpha = 0.5, color = "#0072B2", fill = "#0072B2") 
+  geom_point(aes(color = estimator_alternative, fill = estimator_alternative), alpha = 0.8) +
+  scale_color_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) + #  BottleRocket2
+  scale_fill_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) +
+  geom_abline(intercept = 0, slope = 1, colour= 'black', linetype = "dashed") + 
+  labs(x = expression(paste(hat(beta),""[(MLMA)] ~ "(Benchmark)")), y = expression(paste(hat(beta),""[] ~ "(Bias-robust)")), size = expression(italic(I)^2)) +
+  guides(color = guide_legend(title = "Estimator"), fill = "none") +
+  scale_x_continuous(limits = c(-1,3)) +
+  scale_y_continuous(limits = c(-1,3)) +
+  theme_bw() +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = 0.5, y = 2, label = "Selective reporting \n (selection model)", color = "red", fontface = "bold") 
+
+#beta0_all_pb1.2 <- ggExtra::ggMarginal(beta0_all_pb1, groupColour = TRUE, groupFill = TRUE)
+
+# keep original legend
+options("aplot_guides" = "keep") 
+
+top.dist_beta0_all_pb1 <- mod_stats2_beta0 %>% filter(sig_selmod2 == "Publication bias" & sig_beta0 == "True effect" & study_N >= 20) %>%
+  ggplot(aes(x = beta0)) + 
+  geom_density(color = wes_palette("Rushmore1", 4, type = "discrete")[4], fill=wes_palette("Rushmore1", 4, type = "discrete")[4], alpha = 0.8) + 
+  scale_x_continuous(limits = c(-1,3), expand = expansion(mult = c(0, 0.01))) +
+  labs(x = "", y = "") + 
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+right.dist_beta0_all_pb1 <- mod_stats2_beta0 %>% filter(sig_selmod2 == "Publication bias" & sig_beta0 == "True effect" & study_N >= 20) %>%
+  ggplot(aes(x = beta0_alternative, color = estimator_alternative, fill = estimator_alternative)) + 
+  geom_density(alpha = 0.8) +
+  scale_color_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) + 
+  scale_fill_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) +
+  scale_x_continuous(limits = c(-1,3), expand = expansion(mult = c(0, 0.01))) +
+  guides(fill = "none", color = "none") +
+  labs(x = "", y = "") + 
+  coord_flip() +
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+beta0_all_pb1.2 <- suppressMessages(beta0_all_pb1 %>% 
+  insert_top(top.dist_beta0_all_pb1, height=.3) %>% 
+  insert_right(right.dist_beta0_all_pb1, width=.3)) # print(beta0_all_pb1.2) & theme(legend.position="bottom")
+
+
+# without publication bias
+beta0_all_pb0 <- mod_stats2_beta0 %>% filter(sig_selmod2 == "No publicaiton bias" & study_N >= 20) %>% 
+  ggplot(aes(x = beta0, y = beta0_alternative)) +
+  geom_point(aes(color = estimator_alternative, fill = estimator_alternative), alpha = 0.8) +
+  theme_bw() +
+  scale_color_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) +
+  scale_fill_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) +
+  geom_abline(intercept = 0, slope = 1, colour= 'black', linetype = "dashed") + 
+  labs(x = expression(paste(hat(beta),""[(MLMA)] ~ "(Benchmark)")), y = expression(paste(hat(beta),""[] ~ "(Bias-robust)")), size = expression(italic(I)^2), parse = TRUE) +
+  guides(color = guide_legend(title = "Estimator"), fill = "none") +
+  scale_x_continuous(limits = c(-1,3)) +
+  scale_y_continuous(limits = c(-1,3)) +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = 0.5, y = 2, label = "No selective reporting \n (selection model)", color = "red", fontface = "bold") 
+
+#beta0_all_pb0.2 <- ggExtra::ggMarginal(beta0_all_pb0, groupColour = TRUE, groupFill = TRUE)
+
+# keep original legend
+options("aplot_guides" = "keep") # https://github.com/YuLab-SMU/aplot/issues/6
+
+top.dist_beta0_all_pb0 <- mod_stats2_beta0 %>% filter(sig_selmod2 == "No publicaiton bias" & study_N >= 20) %>%
+  ggplot(aes(x = beta0)) + 
+  geom_density(color = wes_palette("Rushmore1", 4, type = "discrete")[4], fill=wes_palette("Rushmore1", 4, type = "discrete")[4], alpha = 0.8) + 
+  scale_x_continuous(limits = c(-1,3), expand = expansion(mult = c(0, 0.01))) +
+  labs(x = "", y = "") + 
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+right.dist_beta0_all_pb0 <- mod_stats2_beta0 %>% filter(sig_selmod2 == "No publicaiton bias" & study_N >= 20) %>%
+  ggplot(aes(x = beta0_alternative, color = estimator_alternative, fill = estimator_alternative)) + 
+  geom_density(alpha = 0.8) +
+  scale_color_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) + 
+  scale_fill_manual(values = wes_palette("Rushmore1", 4, type = "discrete")[c(1,3)]) +
+  scale_x_continuous(limits = c(-1,3), expand = expansion(mult = c(0, 0.01))) +
+  guides(fill = "none", color = "none") +
+  labs(x = "", y = "") + 
+  coord_flip() +
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+beta0_all_pb0.2 <- suppressMessages(beta0_all_pb0 %>% 
+  insert_top(top.dist_beta0_all_pb0, height=.3) %>% 
+  insert_right(right.dist_beta0_all_pb0, width=.3)) 
+
+#as.ggplot(beta0_all_pb1.2) + as.ggplot(beta0_all_pb0.2) + plot_layout(ncol = 2, nrow = 1)
+
+
+
+#------------------------------------------------------------------#
+# convert se_beta0
+mod_stats2_se <- mod_stats2 %>%
+  select(MA_case, se_MLMA, se_MFEM, se_MFEM_RVE, sig_se, sig_beta0, study_N) %>%
+  pivot_longer(cols = c(se_MFEM, se_MFEM_RVE),
+               names_to = "estimator_alternative", values_to = "se_alternative") 
+names(mod_stats2_se)[names(mod_stats2_se) == "se_MLMA"] <- c("se")
+
+mod_stats2_se$estimator_alternative <- as.factor(mod_stats2_se$estimator_alternative)
+
+mod_stats2_se$estimator_alternative <- factor(mod_stats2_se$estimator_alternative, levels = c("se_MFEM", "se_MFEM_RVE"))
+
+# recode
+mod_stats2_se <- mod_stats2_se %>% mutate(estimator_alternative=dplyr::recode(estimator_alternative, 'se_MFEM'='FE + VCV' , "se_MFEM_RVE" = "FE + VCV + CRVE"))
+
+# add whether using RVE
+mod_stats2_se$RVE <- rep(c("Before", "After"), 448) # nrow(mod_stats2) = 448 or nrow(mod_stats2_se)/4
+
+  
+# se_beta0 (log scale)
+# before CRVE
+se_all_pb1 <- mod_stats2_se %>% filter(RVE == "Before" & sig_beta0 == "True effect" & sig_se == "Publication bias" & study_N >= 20) %>%  
+  ggplot(aes(x = log(se), y = log(se_alternative))) +
+  geom_point(aes(color = estimator_alternative), alpha = 0.8) +
+  scale_color_manual(values = wes_palette("Moonrise3", 4, type = "discrete")[2]) +
+  scale_fill_manual(values = wes_palette("Moonrise3", 4, type = "discrete")[2]) +
+  geom_abline(intercept = 0, slope = 1, colour= 'black', linetype = "dashed") + 
+  labs(x = expression(paste("SE","(",hat(beta),""[(MLMA)],")" ~ "(Benchmark) (log)")), y = expression(paste("SE","(",hat(beta),""[],")" ~ "(Naive variance) (log)")), size = expression(italic(I)^2)) + 
+  guides(color = guide_legend(title = "Estimator"), fill = "none") +
+  scale_x_continuous(limits = c(-5,0)) +
+  scale_y_continuous(limits = c(-5,0)) +
+  theme_bw() +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = -3.0, y = -0.7, label = "Before CRVE", color = "red", fontface = "bold")
+#se_all_pb1.2 <- ggExtra::ggMarginal(se_all_pb1, groupColour = TRUE, groupFill = TRUE)
+
+
+# keep original legend
+options("aplot_guides" = "keep")
+
+top.dist_se_all_pb1 <- mod_stats2_se %>% filter(RVE == "Before" & sig_beta0 == "True effect" & sig_se == "Publication bias" & study_N >= 20) %>%
+  ggplot(aes(x = log(se))) + 
+  geom_density(color = wes_palette("Moonrise3", 4, type = "discrete")[1], fill = wes_palette("Moonrise3", 4, type = "discrete")[1], alpha = 0.8) + 
+  scale_x_continuous(limits =  c(-5,0), expand = expansion(mult = c(0, 0.01))) +
+  labs(x = "", y = "") + 
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+right.dist_se_all_pb1 <- mod_stats2_se %>% filter(RVE == "Before" & sig_beta0 == "True effect" & sig_se == "Publication bias" & study_N >= 20) %>%
+  ggplot(aes(x = log(se_alternative))) + 
+  geom_density(color = wes_palette("Moonrise3", 4, type = "discrete")[2], fill = wes_palette("Moonrise3", 4, type = "discrete")[2], alpha = 0.8) + 
+  scale_x_continuous(limits =  c(-5,0), expand = expansion(mult = c(0, 0.01))) +
+  coord_flip() +
+  labs(x = "", y = "") + 
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+se_all_pb1.2 <- suppressMessages(se_all_pb1 %>% 
+  insert_top(top.dist_se_all_pb1, height=.3) %>% 
+  insert_right(right.dist_se_all_pb1, width=.3)) 
+
+
+# after CRVE
+se_all_pb0 <- mod_stats2_se %>% filter(RVE == "After" & sig_beta0 == "True effect" & sig_se == "No publicaiton bias" & study_N >= 20) %>% 
+  ggplot(aes(x = log(se), y = log(se_alternative))) +
+  geom_point(aes(color = estimator_alternative, fill = estimator_alternative), alpha = 0.8) +
+  scale_color_manual(values = wes_palette("Moonrise3", 4, type = "discrete")[2]) +
+  scale_fill_manual(values = wes_palette("Moonrise3", 4, type = "discrete")[2]) +
+  geom_abline(intercept = 0, slope = 1, colour= 'black', linetype = "dashed") + 
+  labs(x = expression(paste("SE","(",hat(beta),""[(MLMA)],")" ~ "(Benchmark) (log)")), y = expression(paste("SE","(",hat(beta),""[],")" ~ "(Variance-robust) (log)")), size = expression(italic(I)^2)) + 
+  guides(color = guide_legend(title = "Estimator"), fill = "none") +
+  scale_x_continuous(limits = c(-5,0)) +
+  scale_y_continuous(limits = c(-5,0)) +
+  theme_bw() +
+  theme(legend.position= c(0, 1), 
+        legend.justification = c(0, 1),
+        legend.direction = "horizontal",
+        legend.title = element_text(size=8),
+        legend.text = element_text(size=8),
+        strip.background = element_rect(#colour = "transparent", 
+                                        fill = "transparent"),
+        legend.background = element_blank(),
+        axis.text = element_text(size = 12),
+        axis.title = element_text(size = 12)
+        ) + annotate("text", x = -3.0, y = -0.7, label = "After CRVE", color = "red", fontface = "bold")
+#se_all_pb0.2 <- ggExtra::ggMarginal(se_all_pb0, groupColour = TRUE, groupFill = TRUE)
+
+top.dist_se_all_pb0 <- mod_stats2_se %>% filter(RVE == "After" & sig_beta0 == "True effect" & sig_se == "Publication bias" & study_N >= 20) %>%
+  ggplot(aes(x = log(se))) + 
+  geom_density(color = wes_palette("Moonrise3", 4, type = "discrete")[1], fill = wes_palette("Moonrise3", 4, type = "discrete")[1], alpha = 0.8) + 
+  scale_x_continuous(limits =  c(-5,0), expand = expansion(mult = c(0, 0.01))) +
+  labs(x = "", y = "") + 
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+right.dist_se_all_pb0 <- mod_stats2_se %>% filter(RVE == "After" & sig_beta0 == "True effect" & sig_se == "Publication bias" & study_N >= 20) %>%
+  ggplot(aes(x = log(se_alternative))) + 
+  geom_density(color = wes_palette("Moonrise3", 4, type = "discrete")[2], fill = wes_palette("Moonrise3", 4, type = "discrete")[2], alpha = 0.8) + 
+  scale_x_continuous(limits =  c(-5,0), expand = expansion(mult = c(0, 0.01))) +
+  coord_flip() +
+  labs(x = "", y = "") + 
+  theme_void() +
+  theme(plot.margin = grid::unit(c(0, 0, 0, 0), "lines"))
+
+
+se_all_pb0.2 <- suppressMessages(se_all_pb0 %>% 
+  insert_top(top.dist_se_all_pb0, height=.3) %>% 
+  insert_right(right.dist_se_all_pb0, width=.3)) 
+
+
+png(filename = "figS4.png", width = 8, height = 8, units = "in", type = "windows", res = 400)
+cowplot::plot_grid(as.ggplot(beta0_all_pb1.2), as.ggplot(beta0_all_pb0.2),
+                   as.ggplot(se_all_pb1.2), as.ggplot(se_all_pb0.2),
+                   labels = c('A', 'B', 'C', 'D'), label_size = 12, nrow = 2, ncol = 2) %>% suppressWarnings()
+dev.off()
+```
+
+
+#### figS5
+
+```{r}
+# figS5
+# beta0 - MLMA vs. PETPEESE - publication bias
+mod_stats_sensitivity 
+mod_stats2_beta0 %>% filter(sig_selmod2 == "Publication bias" & sig_beta0 == "True effect" & study_N >= 20)
+
+df_2x2_spread <- data_2x2(
+  array_1 = filter(mod_stats_sensitivity, sig_selmod2 == "Publication bias")$beta0_MLMA_flip,
+  array_2 = filter(mod_stats_sensitivity, sig_selmod2 == "Publication bias")$beta0_PETPEESE_flip,
+  array_3 = filter(mod_stats_sensitivity, sig_selmod2 == "Publication bias")$beta0_MLMA_flip,
+  array_4 = filter(mod_stats_sensitivity, sig_selmod2 == "Publication bias")$beta0_PETPEESE_flip,
+  labels = (c('congruent','incongruent')),
+  jit_distance = .09,
+  jit_seed = 321,
+  spread_x_ticks = TRUE) 
+
+paired_beta0_pb1 <- raincloud_2x2_repmes(
+  data = df_2x2_spread, 
+  colors = c("#35274A", "#E1BD6D", "#35274A", "#0B775E"),
+  fills = c("#35274A", "#E1BD6D", "#35274A", "#0B775E"), # https://www.datanovia.com/en/blog/top-r-color-palettes-to-know-for-great-data-visualization/
+  line_color = 'gray',
+  line_alpha = .3,
+  size = 1,
+  alpha = .8,
+  spread_x_ticks = TRUE) +
+
+scale_x_continuous(breaks=c(1,2,3,4), labels=c("MLMA", "PET-PEESE", "MLMA", "FE + VCV"), limits=c(0, 5)) +
+  xlab("Estimator") + 
+  ylab(expression(paste(hat(beta)))) +
+  ylim(-1,3) +
+  annotate(geom = "text", x= 1, y = -1, label = "Selective reporting") +
+  annotate(geom = "text", x= 4, y = -1, label = "Selective reporting") +
+  theme_classic() + 
+  theme(axis.text = element_text(size = 12), axis.title = element_text(size = 14))
+
+
+# beta0 - MLMA vs. PETPEESE - no publication bias
+df_2x2_spread <- data_2x2(
+  array_1 = filter(mod_stats_sensitivity, sig_selmod2 == "No publicaiton bias")$beta0_MLMA_flip,
+  array_2 = filter(mod_stats_sensitivity, sig_selmod2 == "No publicaiton bias")$beta0_PETPEESE_flip,
+  array_3 = filter(mod_stats_sensitivity, sig_selmod2 == "No publicaiton bias")$beta0_MLMA_flip,
+  array_4 = filter(mod_stats_sensitivity, sig_selmod2 == "No publicaiton bias")$beta0_PETPEESE_flip,
+  labels = (c('congruent','incongruent')),
+  jit_distance = .09,
+  jit_seed = 321,
+  spread_x_ticks = TRUE) 
+
+paired_beta0_pb0 <- raincloud_2x2_repmes(
+  data = df_2x2_spread, 
+  colors = c("#35274A", "#E1BD6D", "#35274A", "#0B775E"),
+  fills = c("#35274A", "#E1BD6D", "#35274A", "#0B775E"), # https://www.datanovia.com/en/blog/top-r-color-palettes-to-know-for-great-data-visualization/
+  line_color = 'gray',
+  line_alpha = .3,
+  size = 1,
+  alpha = .8,
+  spread_x_ticks = TRUE) +
+
+scale_x_continuous(breaks=c(1,2,3,4), labels=c("MLMA", "PET-PEESE", "MLMA", "FE + VCV"), limits=c(0, 5)) +
+  xlab("Estimator") + 
+  ylab(expression(paste(hat(beta)))) +
+  ylim(-1,3) +
+  annotate(geom = "text", x= 1, y = -1, label = "No selective reportings") +
+  annotate(geom = "text", x= 4, y = -1, label = "No selective reporting") +
+  theme_classic() + 
+  theme(axis.text = element_text(size = 12), axis.title = element_text(size = 14))
+
+png(filename = "figS5.png", width = 10, height = 4, units = "in", type = "windows", res = 400)
+cowplot::plot_grid(paired_beta0_pb1, paired_beta0_pb0, labels = c('A', 'B'), label_size = 12,nrow = 1, ncol = 2) %>% suppressWarnings()
+dev.off()
+```
+
